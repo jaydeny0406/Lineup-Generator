@@ -4,6 +4,8 @@ A local Python web app that scrapes Athletic.net event-record pages, estimates s
 
 The Division selector supports `Mens`, `Womens`, and `Both`. Both mode generates two independent lineups and displays them in separate Mens and Womens result tabs.
 
+List unavailable athletes in the `Injured athletes` box, one exact athlete name per line. Matching is case-insensitive, and injured athletes are removed from individual events, relay splits, and historic relay teams.
+
 ## Run
 
 ```powershell
@@ -39,4 +41,7 @@ python -m unittest
 - If the API is unavailable, the app can still fall back to HTML/text parsing and Reader URL variants.
 - If `beautifulsoup4` is installed, fallback HTML parsing uses it for cleaner table extraction. If not, it uses the standard library.
 - The optimizer enforces four events per athlete and avoids consecutive running races.
+- Projected individual-event fields include only each opponent team's best three athletes per event.
+- Relay projections include exactly one entry per opponent school: its fastest recorded relay, or one synthetic relay if it has no recorded team.
+- Finalization checks all 18 supported events. Relays below five projected points use depth runners instead of being omitted.
 - Individual scoring is `10 8 6 5 4 3 2 1`; relay scoring is `10 8 6 4 2`.

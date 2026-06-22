@@ -159,6 +159,62 @@ class ParserTests(unittest.TestCase):
             ("One Runner", "Two Runner", "Three Runner", "Four Runner"),
         )
 
+    def test_named_relay_split_is_not_an_individual_seed(self):
+        payload = {
+            "eventRecords": [
+                {
+                    "Gender": "M",
+                    "Event": "400 Meters",
+                    "PersonalEvent": True,
+                    "Result": "51.00",
+                    "FirstName": "Avery",
+                    "LastName": "Runner",
+                    "IDResult": 1,
+                },
+                {
+                    "Gender": "M",
+                    "Event": "400 Meters - Relay Split",
+                    "PersonalEvent": True,
+                    "Result": "49.5h",
+                    "FirstName": "Avery",
+                    "LastName": "Runner",
+                    "IDResult": 2,
+                },
+            ],
+            "relayMembers": [],
+            "preferences": {},
+        }
+        result = app.parse_athletic_api_data(payload, "Test", "school", "mens")
+        self.assertEqual(len(result.performances), 1)
+        self.assertEqual(result.performances[0].event, "400m")
+        self.assertEqual(result.performances[0].value, 51.0)
+        self.assertEqual(len(result.relay_splits), 1)
+        self.assertEqual(result.relay_splits[0].event, "400m")
+        self.assertEqual(result.relay_splits[0].value, 49.5)
+
+    def test_relay_split_description_is_also_classified_as_split_only(self):
+        payload = {
+            "eventRecords": [
+                {
+                    "Gender": "F",
+                    "Event": "800 Meters",
+                    "Description": "Relay Split",
+                    "PersonalEvent": True,
+                    "Result": "2:14.5h",
+                    "FirstName": "Jordan",
+                    "LastName": "Runner",
+                    "IDResult": 3,
+                }
+            ],
+            "relayMembers": [],
+            "preferences": {},
+        }
+        result = app.parse_athletic_api_data(payload, "Test", "school", "womens")
+        self.assertEqual(result.performances, [])
+        self.assertEqual(len(result.relay_splits), 1)
+        self.assertEqual(result.relay_splits[0].event, "800m")
+        self.assertEqual(result.relay_splits[0].value, 134.5)
+
     def test_scrape_team_data_uses_api_for_reader_prefixed_input(self):
         payload = {
             "eventRecords": [
@@ -189,6 +245,62 @@ class ParserTests(unittest.TestCase):
 
 
 class OptimizerTests(unittest.TestCase):
+    def test_injured_athlete_is_removed_from_all_team_data(self):
+        data = app.ScrapeResult(
+            performances=[
+                app.Performance("Alex Carter", "100m", "10.90", 10.9, True, "Team", "school"),
+                app.Performance("Healthy Runner", "100m", "11.10", 11.1, True, "Team", "school"),
+            ],
+            relay_history=[
+                app.RelayPerformance(
+                    "4x100 relay",
+                    ("Healthy Runner", "Alex Carter", "Third Runner", "Fourth Runner"),
+                    "43.00",
+                    43.0,
+                    "Team",
+                    "school",
+                )
+            ],
+            relay_splits=[
+                app.Performance("Alex Carter", "100m", "10.5h", 10.5, True, "Team", "school")
+            ],
+        )
+        filtered = app.filter_injured_athletes(data, ["  ALEX-CARTER  "])
+        self.assertEqual([perf.athlete for perf in filtered.performances], ["Healthy Runner"])
+        self.assertEqual(filtered.relay_history, [])
+        self.assertEqual(filtered.relay_splits, [])
+
+    def test_run_optimizer_does_not_select_injured_athlete(self):
+        school = [
+            app.Performance("Injured Star", "100m", "10.50", 10.5, True, "Team", "school"),
+            app.Performance("Healthy One", "100m", "10.90", 10.9, True, "Team", "school"),
+            app.Performance("Healthy Two", "100m", "11.00", 11.0, True, "Team", "school"),
+            app.Performance("Healthy Three", "100m", "11.10", 11.1, True, "Team", "school"),
+        ]
+        scrape_result = app.ScrapeResult(school, [], [])
+        with patch("app.scrape_team_data", return_value=scrape_result):
+            result = app.run_optimizer(
+                "https://example.test",
+                [],
+                "mens",
+                ["injured star"],
+            )
+        selected_names = {
+            entry["athlete"]
+            for entries in result.lineup.values()
+            for entry in entries
+        }
+        selected_names.update(
+            athlete
+            for relay in result.relays.values()
+            for athlete in relay["athletes"]
+        )
+        self.assertNotIn("Injured Star", selected_names)
+
+    def test_ui_includes_injured_athletes_input(self):
+        self.assertIn('id="injured-athletes"', app.HTML_PAGE)
+        self.assertIn("injuredAthletes:", app.HTML_PAGE)
+
     def test_both_mode_keeps_divisions_separate(self):
         mens_result = app.LineupResult(
             lineup={"100m": [{"athlete": "Mens Runner"}]},
@@ -207,7 +319,11 @@ class OptimizerTests(unittest.TestCase):
             errors=[],
         )
         with patch("app.run_optimizer", side_effect=[mens_result, womens_result]) as optimize:
-            result = app.run_optimizer_both("https://example.test", ["https://opponent.test"])
+            result = app.run_optimizer_both(
+                "https://example.test",
+                ["https://opponent.test"],
+                ["Injured Runner"],
+            )
         self.assertEqual(result["mode"], "both")
         self.assertEqual(
             result["division_results"]["mens"]["lineup"]["100m"][0]["athlete"],
@@ -219,6 +335,8 @@ class OptimizerTests(unittest.TestCase):
         )
         self.assertEqual(optimize.call_args_list[0].args[2], "mens")
         self.assertEqual(optimize.call_args_list[1].args[2], "womens")
+        self.assertEqual(optimize.call_args_list[0].args[3], ["Injured Runner"])
+        self.assertEqual(optimize.call_args_list[1].args[3], ["Injured Runner"])
 
     def test_ui_calls_combined_division_both(self):
         self.assertIn('<option value="both">Both</option>', app.HTML_PAGE)
@@ -247,6 +365,60 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(details["Alex Fast"]["points"], 10.0)
         self.assertEqual(details["John Doe"]["place_label"], "3rd")
         self.assertEqual(details["John Doe"]["points"], 6.0)
+
+    def test_opponent_team_is_limited_to_top_three_entries(self):
+        school = [
+            app.Performance("School A One", "100m", "10.88", 10.88, True, "School A", "school"),
+            app.Performance("School A Two", "100m", "10.98", 10.98, True, "School A", "school"),
+            app.Performance("School A Three", "100m", "11.34", 11.34, True, "School A", "school"),
+        ]
+        opponent_times = [11.00, 11.01, 11.03, 11.07, 11.17, 11.24]
+        opponents = [
+            app.Performance(
+                f"School B Runner {index}",
+                "100m",
+                f"{time:.2f}",
+                time,
+                True,
+                "School B",
+                "opponent",
+            )
+            for index, time in enumerate(opponent_times, start=1)
+        ]
+        selected = app.select_opponent_entries(opponents, "100m")
+        self.assertEqual([entry.value for entry in selected], [11.00, 11.01, 11.03])
+        total, details = app.score_event_details("100m", school, opponents)
+        self.assertEqual(details["School A Three"]["place_label"], "6th")
+        self.assertEqual(details["School A Three"]["points"], 3.0)
+        self.assertEqual(total, 21.0)
+
+    def test_each_opponent_team_gets_three_entries(self):
+        opponents = []
+        for source, starting_time in (("School B", 11.00), ("School C", 10.90)):
+            for index in range(5):
+                time = starting_time + index * 0.01
+                opponents.append(
+                    app.Performance(
+                        f"{source} Runner {index}",
+                        "100m",
+                        f"{time:.2f}",
+                        time,
+                        True,
+                        source,
+                        "opponent",
+                    )
+                )
+        selected = app.select_opponent_entries(opponents, "100m")
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(
+            {source: sum(entry.source == source for entry in selected) for source in ("School B", "School C")},
+            {"School B": 3, "School C": 3},
+        )
+
+    def test_display_mark_removes_athletic_net_suffix(self):
+        self.assertEqual(app.format_display_mark("9:43.55a"), "9:43.55")
+        self.assertEqual(app.format_display_mark("49.5h"), "49.5")
+        self.assertEqual(app.format_display_mark("10.86"), "10.86")
 
     def test_output_lineup_entries_are_best_to_worst(self):
         school = [
@@ -326,6 +498,150 @@ class OptimizerTests(unittest.TestCase):
         )
         self.assertEqual(selection.leg_times, (50.0, 51.0, 52.0, 49.5))
         self.assertAlmostEqual(selection.projected_time, 199.5)
+
+    def test_named_split_can_improve_synthetic_relay_only(self):
+        school = [
+            app.Performance("Alpha Runner", "400m", "51.00", 51.0, True, "Team", "school"),
+            app.Performance("Bravo Runner", "400m", "50.00", 50.0, True, "Team", "school"),
+            app.Performance("Charlie Runner", "400m", "51.50", 51.5, True, "Team", "school"),
+            app.Performance("Delta Runner", "400m", "52.50", 52.5, True, "Team", "school"),
+        ]
+        split_records = [
+            app.Performance("Alpha Runner", "400m", "49.5h", 49.5, True, "Team", "school")
+        ]
+        selection = app.synthesize_relay(
+            "4x400 relay",
+            school,
+            defaultdict(list),
+            [],
+            split_records,
+        )
+        self.assertEqual(
+            [perf.value for perf in school if perf.athlete == "Alpha Runner"],
+            [51.0],
+        )
+        self.assertIn(49.5, selection.leg_times)
+        self.assertAlmostEqual(selection.projected_time, 200.5)
+
+    def test_low_scoring_relay_still_gets_depth_lineup(self):
+        school = [
+            app.Performance(
+                f"School Runner {index}",
+                "200m",
+                f"{23.0 + index / 10:.2f}",
+                23.0 + index / 10,
+                True,
+                "School",
+                "school",
+            )
+            for index in range(8)
+        ]
+        opponent_relays = [
+            app.RelayPerformance(
+                "4x200 relay",
+                (f"A{index}", f"B{index}", f"C{index}", f"D{index}"),
+                f"1:{20 + index:02d}.00",
+                80.0 + index,
+                f"Opponent {index}",
+                "opponent",
+            )
+            for index in range(5)
+        ]
+        selection = app.choose_relay_team(
+            "4x200 relay",
+            school,
+            [],
+            defaultdict(list),
+            [],
+            opponent_relays,
+        )
+        self.assertIsNotNone(selection)
+        self.assertEqual(len(selection.athletes), 4)
+        self.assertIn("depth runners", selection.source_mark)
+
+    def test_opponent_school_enters_only_its_fastest_relay(self):
+        opponent_relays = [
+            app.RelayPerformance(
+                "4x200 relay",
+                (f"A{index}", f"B{index}", f"C{index}", f"D{index}"),
+                f"1:{30 + index:02d}.00",
+                90.0 + index,
+                "School B",
+                "opponent",
+            )
+            for index in range(5)
+        ]
+        estimates = app.estimate_opponent_relays(
+            "4x200 relay",
+            [],
+            opponent_relays,
+        )
+        self.assertEqual(estimates, [89.8])
+        self.assertEqual(
+            app.projected_relay_points("4x200 relay", 91.0, [], opponent_relays),
+            8.0,
+        )
+
+    def test_each_opponent_school_gets_one_relay_entry(self):
+        opponent_relays = [
+            app.RelayPerformance(
+                "4x400 relay",
+                ("B One", "B Two", "B Three", "B Four"),
+                "3:20.00",
+                200.0,
+                "School B",
+                "opponent",
+            ),
+            app.RelayPerformance(
+                "4x400 relay",
+                ("B Five", "B Six", "B Seven", "B Eight"),
+                "3:22.00",
+                202.0,
+                "School B",
+                "opponent",
+            ),
+            app.RelayPerformance(
+                "4x400 relay",
+                ("C One", "C Two", "C Three", "C Four"),
+                "3:21.00",
+                201.0,
+                "School C",
+                "opponent",
+            ),
+        ]
+        estimates = sorted(
+            app.estimate_opponent_relays("4x400 relay", [], opponent_relays)
+        )
+        self.assertEqual(estimates, [199.8, 200.8])
+
+    def test_complete_team_generates_all_eighteen_events(self):
+        school = []
+        for event in [event for event in app.EVENTS if event not in app.RELAY_EVENTS]:
+            count = 4 if event in {"100m", "200m", "400m", "800m"} else 1
+            for index in range(count):
+                is_time = event in app.TRACK_EVENTS
+                value = (10.0 + index) if is_time else (200.0 + index)
+                school.append(
+                    app.Performance(
+                        f"{event} Athlete {index}",
+                        event,
+                        str(value),
+                        value,
+                        is_time,
+                        "School",
+                        "school",
+                    )
+                )
+        result = app.build_lineup(school, [])
+        self.assertEqual(result["missing_events"], [])
+        self.assertTrue(
+            all(result["lineup"][event] for event in app.EVENTS if event not in app.RELAY_EVENTS)
+        )
+        self.assertEqual(set(result["relays"]), app.RELAY_EVENTS)
+        self.assertEqual(
+            len([event for event in app.EVENTS if result["lineup"].get(event) or event in result["relays"]]),
+            18,
+        )
 
 
 if __name__ == "__main__":
