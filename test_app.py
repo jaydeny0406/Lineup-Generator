@@ -441,6 +441,126 @@ class OptimizerTests(unittest.TestCase):
         self.assertTrue(app.can_event_set_stand(["4x800 relay", "800m", "1600m"]))
         self.assertFalse(app.can_event_set_stand(["800m", "1600m", "3200m"]))
         self.assertFalse(app.can_event_set_stand(["800m", "1600m", "long jump"]))
+        self.assertFalse(app.can_event_set_stand(["400m", "4x400 relay"]))
+
+    def test_elite_pass_replaces_worse_individual_entry_without_losing_points(self):
+        school = [
+            app.Performance("Star Sprinter", "100m", "10.50", 10.5, True, "Team", "school"),
+            app.Performance("Star Sprinter", "200m", "21.50", 21.5, True, "Team", "school"),
+            app.Performance("Star Sprinter", "long jump", "21' 8", 260.0, False, "Team", "school"),
+            app.Performance("Star Sprinter", "400m", "50.00", 50.0, True, "Team", "school"),
+            app.Performance("Relay One", "400m", "51.00", 51.0, True, "Team", "school"),
+            app.Performance("Relay Two", "400m", "52.00", 52.0, True, "Team", "school"),
+            app.Performance("Relay Three", "400m", "53.00", 53.0, True, "Team", "school"),
+        ]
+        lineup = {
+            "100m": ["Star Sprinter"],
+            "200m": ["Star Sprinter"],
+            "long jump": ["Star Sprinter"],
+            "400m": ["Relay One", "Relay Two", "Relay Three"],
+        }
+        improved_lineup, _relays = app.optimize_elite_sprint_utilization(
+            lineup,
+            {},
+            school,
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        self.assertIn("Star Sprinter", improved_lineup["400m"])
+        self.assertNotIn("Relay Three", improved_lineup["400m"])
+
+    def test_elite_pass_replaces_slowest_synthetic_relay_leg(self):
+        school = [
+            app.Performance("Star Sprinter", "100m", "10.50", 10.5, True, "Team", "school"),
+            app.Performance("Star Sprinter", "200m", "21.50", 21.5, True, "Team", "school"),
+            app.Performance("Star Sprinter", "long jump", "21' 8", 260.0, False, "Team", "school"),
+            app.Performance("Relay One", "100m", "11.00", 11.0, True, "Team", "school"),
+            app.Performance("Relay Two", "100m", "11.10", 11.1, True, "Team", "school"),
+            app.Performance("Relay Three", "100m", "11.20", 11.2, True, "Team", "school"),
+            app.Performance("Relay Four", "100m", "11.30", 11.3, True, "Team", "school"),
+        ]
+        lineup = {
+            "100m": ["Star Sprinter"],
+            "200m": ["Star Sprinter"],
+            "long jump": ["Star Sprinter"],
+        }
+        relays = {
+            "4x100 relay": app.RelaySelection(
+                "4x100 relay",
+                ("Relay One", "Relay Two", "Relay Three", "Relay Four"),
+                41.9,
+                "synthetic",
+                "best individual PR/relay split",
+                (11.0, 11.1, 11.2, 11.3),
+            )
+        }
+        _lineup, improved_relays = app.optimize_elite_sprint_utilization(
+            lineup,
+            relays,
+            school,
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        self.assertIn("Star Sprinter", improved_relays["4x100 relay"].athletes)
+        self.assertNotIn("Relay Four", improved_relays["4x100 relay"].athletes)
+
+    def test_elite_pass_does_not_replace_higher_ranked_elite_later(self):
+        school = [
+            app.Performance("Alpha Star", "100m", "10.50", 10.5, True, "Team", "school"),
+            app.Performance("Alpha Star", "200m", "21.50", 21.5, True, "Team", "school"),
+            app.Performance("Alpha Star", "long jump", "22' 0", 264.0, False, "Team", "school"),
+            app.Performance("Alpha Star", "400m", "49.00", 49.0, True, "Team", "school"),
+            app.Performance("Beta Star", "100m", "10.60", 10.6, True, "Team", "school"),
+            app.Performance("Beta Star", "200m", "21.60", 21.6, True, "Team", "school"),
+            app.Performance("Beta Star", "long jump", "21' 8", 260.0, False, "Team", "school"),
+            app.Performance("Beta Star", "400m", "50.00", 50.0, True, "Team", "school"),
+            app.Performance("Relay One", "400m", "51.00", 51.0, True, "Team", "school"),
+            app.Performance("Relay Two", "400m", "52.00", 52.0, True, "Team", "school"),
+        ]
+        lineup = {
+            "100m": ["Alpha Star", "Beta Star"],
+            "200m": ["Alpha Star", "Beta Star"],
+            "long jump": ["Alpha Star", "Beta Star"],
+            "400m": ["Relay One", "Relay Two", "Alpha Star"],
+        }
+        improved_lineup, _relays = app.optimize_elite_sprint_utilization(
+            lineup,
+            {},
+            school,
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        self.assertIn("Alpha Star", improved_lineup["400m"])
+        self.assertIn("Beta Star", improved_lineup["400m"])
+        self.assertNotIn("Relay Two", improved_lineup["400m"])
+
+    def test_elite_rank_uses_only_flat_sprint_and_relay_value(self):
+        school = [
+            app.Performance("Flat Star", "100m", "10.50", 10.5, True, "Team", "school"),
+            app.Performance("Flat Star", "200m", "21.50", 21.5, True, "Team", "school"),
+            app.Performance("Flat Star", "400m", "50.00", 50.0, True, "Team", "school"),
+            app.Performance("Hurdle Star", "110h", "14.40", 14.4, True, "Team", "school"),
+            app.Performance("Hurdle Star", "300h", "39.00", 39.0, True, "Team", "school"),
+            app.Performance("Hurdle Star", "200m", "21.70", 21.7, True, "Team", "school"),
+            app.Performance("Hurdle Star", "high jump", "6-2", 74.0, False, "Team", "school"),
+            app.Performance("Jump Star", "long jump", "23' 0", 276.0, False, "Team", "school"),
+            app.Performance("Jump Star", "triple jump", "46' 0", 552.0, False, "Team", "school"),
+            app.Performance("Jump Star", "100m", "10.90", 10.9, True, "Team", "school"),
+        ]
+        potentials = app.compute_scores(school, [])
+        ranked = app.rank_elite_sprint_jump_athletes(school, potentials, {}, [], [], [])
+        self.assertIn("Flat Star", ranked)
+        self.assertNotIn("Hurdle Star", ranked)
+        self.assertNotIn("Jump Star", ranked)
 
     def test_historic_relay_can_beat_synthetic(self):
         school = [
@@ -617,7 +737,7 @@ class OptimizerTests(unittest.TestCase):
     def test_complete_team_generates_all_eighteen_events(self):
         school = []
         for event in [event for event in app.EVENTS if event not in app.RELAY_EVENTS]:
-            count = 4 if event in {"100m", "200m", "400m", "800m"} else 1
+            count = 8 if event == "400m" else 4 if event in {"100m", "200m", "800m"} else 1
             for index in range(count):
                 is_time = event in app.TRACK_EVENTS
                 value = (10.0 + index) if is_time else (200.0 + index)

@@ -19,9 +19,11 @@ from urllib.request import Request, urlopen
 
 INDIVIDUAL_POINTS = [10, 8, 6, 5, 4, 3, 2, 1]
 RELAY_POINTS = [10, 8, 6, 4, 2]
-APP_VERSION = "2026.06.22-injured-athletes-v9"
+APP_VERSION = "2026.06.24-flat-sprint-elite-v12"
 MAX_EVENTS_PER_ATHLETE = 4
 MAX_INDIVIDUAL_ENTRIES = 3
+ELITE_ATHLETE_COUNT = 5
+MAX_ELITE_REPLACEMENTS = 20
 
 RUNNING_ORDER = {
     "4x800 relay": 1,
@@ -42,6 +44,8 @@ FIELD_EVENTS = {"high jump", "pole vault", "discus", "shot put", "long jump", "t
 TRACK_EVENTS = set(RUNNING_ORDER)
 RELAY_EVENTS = {"4x100 relay", "4x200 relay", "4x400 relay", "4x800 relay"}
 DISTANCE_EVENTS = {"4x800 relay", "800m", "1600m", "3200m"}
+ELITE_INDIVIDUAL_EVENTS = {"100m", "200m", "400m"}
+SPRINT_RELAY_EVENTS = {"4x100 relay", "4x200 relay", "4x400 relay"}
 EVENTS = list(RUNNING_ORDER) + ["long jump", "triple jump", "high jump", "pole vault", "shot put", "discus"]
 
 RELAY_BASE_EVENT = {
@@ -123,6 +127,16 @@ class LineupResult:
     total_points: float
     scraped: dict[str, int]
     errors: list[str]
+
+
+@dataclass
+class EliteReplacement:
+    lineup: dict[str, list[str]]
+    relays: dict[str, RelaySelection]
+    event: str
+    total_delta: float
+    event_delta: float
+    speed_delta: float
 
 
 def fetch_html(url: str) -> str:
@@ -1027,6 +1041,16 @@ def build_lineup(
         school_relay_splits,
         opponent_relay_splits,
     )
+    lineup, relays = optimize_elite_sprint_utilization(
+        lineup,
+        relays,
+        school,
+        opponents,
+        school_relay_history,
+        opponent_relay_history,
+        school_relay_splits,
+        opponent_relay_splits,
+    )
     missing_events = [
         event
         for event in EVENTS
@@ -1186,6 +1210,600 @@ def force_empty_individual_events(
         _cost, _rank, perf, removals = min(options, key=lambda item: (item[0], item[1]))
         remove_athlete_events(lineup, athlete_events, perf.athlete, removals)
         try_add_entry(lineup, athlete_events, perf.athlete, event)
+
+
+def optimize_elite_sprint_utilization(
+    lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    opponents: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    opponent_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    opponent_relay_splits: list[Performance],
+) -> tuple[dict[str, list[str]], dict[str, RelaySelection]]:
+    """Push top flat sprinters toward four legal running events when it does not cost points."""
+    potentials = compute_scores(school, opponents)
+    elite_order = rank_elite_sprint_jump_athletes(
+        school,
+        potentials,
+        relays,
+        opponents,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+    protected: set[str] = set()
+    replacements = 0
+    for athlete in elite_order:
+        while replacements < MAX_ELITE_REPLACEMENTS:
+            athlete_events = collect_athlete_events(lineup, relays)
+            if len(athlete_events[athlete]) >= MAX_EVENTS_PER_ATHLETE:
+                break
+            replacement = find_best_elite_replacement(
+                athlete,
+                protected,
+                lineup,
+                relays,
+                school,
+                opponents,
+                school_relay_history,
+                opponent_relay_history,
+                school_relay_splits,
+                opponent_relay_splits,
+            )
+            if not replacement:
+                break
+            lineup = replacement.lineup
+            relays = replacement.relays
+            replacements += 1
+        protected.add(athlete)
+    return lineup, relays
+
+
+def rank_elite_sprint_jump_athletes(
+    school: list[Performance],
+    potentials: dict[tuple[str, str], float],
+    relays: dict[str, RelaySelection],
+    opponents: list[Performance],
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> list[str]:
+    """Rank top flat sprinters using only 100m, 200m, 400m, and sprint relay value."""
+    priority_grouped: dict[str, list[float]] = defaultdict(list)
+    all_grouped: dict[str, list[float]] = defaultdict(list)
+    for perf in school:
+        if perf.event in ELITE_INDIVIDUAL_EVENTS:
+            priority_grouped[perf.athlete].append(potentials.get((perf.athlete, perf.event), 0.0))
+        if perf.event in ELITE_INDIVIDUAL_EVENTS:
+            all_grouped[perf.athlete].append(potentials.get((perf.athlete, perf.event), 0.0))
+    relay_bonus = elite_relay_bonus_by_athlete(
+        relays,
+        opponents,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+    possible_events = possible_elite_events_by_athlete(school, relays)
+    ranked = []
+    for athlete, scores in all_grouped.items():
+        if len(possible_events.get(athlete, set())) < MAX_EVENTS_PER_ATHLETE:
+            continue
+        bonus = relay_bonus.get(athlete, 0.0)
+        priority_value = sum(sorted(priority_grouped.get(athlete, []), reverse=True)[:MAX_EVENTS_PER_ATHLETE]) + bonus
+        top_four_value = sum(sorted(scores, reverse=True)[:MAX_EVENTS_PER_ATHLETE])
+        if priority_value > 0 or top_four_value > 0:
+            ranked.append((priority_value, top_four_value, bonus, athlete))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
+    return [athlete for _priority, _top_four, _bonus, athlete in ranked[:ELITE_ATHLETE_COUNT]]
+
+
+def possible_elite_events_by_athlete(
+    school: list[Performance], relays: dict[str, RelaySelection]
+) -> dict[str, set[str]]:
+    """Return flat-sprint and sprint-relay events where each athlete can be considered."""
+    possible: dict[str, set[str]] = defaultdict(set)
+    individual_events_by_athlete: dict[str, set[str]] = defaultdict(set)
+    for perf in school:
+        individual_events_by_athlete[perf.athlete].add(perf.event)
+        if perf.event in ELITE_INDIVIDUAL_EVENTS:
+            possible[perf.athlete].add(perf.event)
+    for relay_event in SPRINT_RELAY_EVENTS:
+        base_event = RELAY_BASE_EVENT[relay_event]
+        for athlete, events in individual_events_by_athlete.items():
+            if base_event in events:
+                possible[athlete].add(relay_event)
+        relay = relays.get(relay_event)
+        if relay:
+            for athlete in relay.athletes:
+                possible[athlete].add(relay_event)
+    return possible
+
+
+def elite_relay_bonus_by_athlete(
+    relays: dict[str, RelaySelection],
+    opponents: list[Performance],
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> dict[str, float]:
+    """Give relay-value credit to athletes on the two best current sprint relays."""
+    bonuses: dict[str, float] = defaultdict(float)
+    athlete_events = collect_athlete_events({}, relays)
+    scored_relays = []
+    for event, relay in relays.items():
+        if event not in SPRINT_RELAY_EVENTS:
+            continue
+        time_value = relay_selection_time_for_build(relay, athlete_events)
+        points = projected_relay_points(
+            event,
+            time_value,
+            opponents,
+            opponent_relay_history,
+            opponent_relay_splits,
+        )
+        scored_relays.append((points, time_value, relay))
+    scored_relays.sort(key=lambda item: (-item[0], item[1]))
+    for points, _time_value, relay in scored_relays[:2]:
+        if points <= 0:
+            continue
+        for athlete in relay.athletes:
+            bonuses[athlete] += points / 4.0
+    return bonuses
+
+
+def find_best_elite_replacement(
+    athlete: str,
+    protected: set[str],
+    lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    opponents: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    opponent_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    opponent_relay_splits: list[Performance],
+) -> EliteReplacement | None:
+    """Find the best legal non-losing event addition for one elite athlete."""
+    base_result = evaluate_lineup(
+        lineup,
+        relays,
+        school,
+        opponents,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+    best_perf = {(perf.athlete, perf.event): perf for perf in school}
+    replacements: list[EliteReplacement] = []
+    for event in sorted(ELITE_INDIVIDUAL_EVENTS, key=event_sort_value):
+        replacement = try_elite_individual_replacement(
+            athlete,
+            event,
+            protected,
+            lineup,
+            relays,
+            school,
+            school_relay_history,
+            school_relay_splits,
+            opponents,
+            best_perf,
+            base_result,
+            opponent_relay_history,
+            opponent_relay_splits,
+        )
+        if replacement:
+            replacements.append(replacement)
+    for event in sorted(SPRINT_RELAY_EVENTS, key=event_sort_value):
+        replacement = try_elite_relay_replacement(
+            athlete,
+            event,
+            protected,
+            lineup,
+            relays,
+            school,
+            opponents,
+            school_relay_history,
+            school_relay_splits,
+            base_result,
+            opponent_relay_history,
+            opponent_relay_splits,
+        )
+        if replacement:
+            replacements.append(replacement)
+    if not replacements:
+        return None
+    return max(
+        replacements,
+        key=lambda item: (
+            item.total_delta,
+            item.event_delta,
+            item.speed_delta,
+            -event_sort_value(item.event),
+        ),
+    )
+
+
+def try_elite_individual_replacement(
+    athlete: str,
+    event: str,
+    protected: set[str],
+    lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    opponents: list[Performance],
+    best_perf: dict[tuple[str, str], Performance],
+    base_result: LineupResult,
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> EliteReplacement | None:
+    """Try adding an elite athlete to an individual event by replacing the weakest entry."""
+    if event not in lineup or athlete in lineup[event]:
+        return None
+    perf = best_perf.get((athlete, event))
+    if not perf:
+        return None
+    athlete_events = collect_athlete_events(lineup, relays)
+    if not can_take_event(athlete_events[athlete], event):
+        return None
+    trial_lineup = clone_lineup(lineup)
+    trial_relays = dict(relays)
+    speed_delta = 0.0
+    if len(trial_lineup[event]) >= MAX_INDIVIDUAL_ENTRIES:
+        target = worst_individual_entry(event, trial_lineup[event], best_perf)
+        if not target:
+            return None
+        if not is_better(perf.value, target.value, perf.is_time):
+            return None
+        if target.athlete in protected:
+            compensated = try_compensated_protected_individual_replacement(
+                athlete,
+                perf,
+                event,
+                target,
+                protected,
+                lineup,
+                relays,
+                school,
+                school_relay_history,
+                school_relay_splits,
+                opponents,
+                best_perf,
+                base_result,
+                opponent_relay_history,
+                opponent_relay_splits,
+            )
+            if compensated:
+                return compensated
+            target = worst_individual_entry(event, trial_lineup[event], best_perf, protected)
+            if not target or not is_better(perf.value, target.value, perf.is_time):
+                return None
+        speed_delta = target.value - perf.value if perf.is_time else perf.value - target.value
+        slot = trial_lineup[event].index(target.athlete)
+        trial_lineup[event][slot] = athlete
+    else:
+        trial_lineup[event].append(athlete)
+    return evaluated_elite_replacement(
+        trial_lineup,
+        trial_relays,
+        event,
+        school,
+        opponents,
+        base_result,
+        speed_delta,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+
+
+def try_compensated_protected_individual_replacement(
+    athlete: str,
+    perf: Performance,
+    event: str,
+    target: Performance,
+    protected: set[str],
+    lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    opponents: list[Performance],
+    best_perf: dict[tuple[str, str], Performance],
+    base_result: LineupResult,
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> EliteReplacement | None:
+    """Let a faster elite take a protected athlete's slot only if the protected athlete is re-used."""
+    trial_lineup = clone_lineup(lineup)
+    slot = trial_lineup[event].index(target.athlete)
+    trial_lineup[event][slot] = athlete
+    base_speed_delta = target.value - perf.value if perf.is_time else perf.value - target.value
+    options = compensated_individual_options(
+        target.athlete,
+        event,
+        trial_lineup,
+        relays,
+        school,
+        opponents,
+        best_perf,
+        base_result,
+        base_speed_delta,
+        protected,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+    options.extend(
+        compensated_relay_options(
+            target.athlete,
+            event,
+            trial_lineup,
+            relays,
+            school,
+            school_relay_history,
+            school_relay_splits,
+            opponents,
+            base_result,
+            base_speed_delta,
+            protected,
+            opponent_relay_history,
+            opponent_relay_splits,
+        )
+    )
+    if not options:
+        return None
+    return max(
+        options,
+        key=lambda item: (
+            item.total_delta,
+            item.event_delta,
+            item.speed_delta,
+            -event_sort_value(item.event),
+        ),
+    )
+
+
+def compensated_individual_options(
+    protected_athlete: str,
+    replaced_event: str,
+    trial_lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    opponents: list[Performance],
+    best_perf: dict[tuple[str, str], Performance],
+    base_result: LineupResult,
+    base_speed_delta: float,
+    protected: set[str],
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> list[EliteReplacement]:
+    """Try moving a displaced protected athlete into another individual flat sprint event."""
+    options: list[EliteReplacement] = []
+    athlete_events = collect_athlete_events(trial_lineup, relays)
+    for new_event in sorted(ELITE_INDIVIDUAL_EVENTS, key=event_sort_value):
+        if new_event == replaced_event or protected_athlete in trial_lineup.get(new_event, []):
+            continue
+        protected_perf = best_perf.get((protected_athlete, new_event))
+        if not protected_perf or not can_take_event(athlete_events[protected_athlete], new_event):
+            continue
+        option_lineup = clone_lineup(trial_lineup)
+        speed_delta = base_speed_delta
+        if len(option_lineup.get(new_event, [])) >= MAX_INDIVIDUAL_ENTRIES:
+            target = worst_individual_entry(new_event, option_lineup[new_event], best_perf, protected)
+            if not target or not is_better(protected_perf.value, target.value, protected_perf.is_time):
+                continue
+            speed_delta += target.value - protected_perf.value if protected_perf.is_time else protected_perf.value - target.value
+            option_lineup[new_event][option_lineup[new_event].index(target.athlete)] = protected_athlete
+        else:
+            option_lineup.setdefault(new_event, []).append(protected_athlete)
+        replacement = evaluated_elite_replacement(
+            option_lineup,
+            dict(relays),
+            replaced_event,
+            school,
+            opponents,
+            base_result,
+            speed_delta,
+            opponent_relay_history,
+            opponent_relay_splits,
+        )
+        if replacement:
+            options.append(replacement)
+    return options
+
+
+def compensated_relay_options(
+    protected_athlete: str,
+    replaced_event: str,
+    trial_lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    opponents: list[Performance],
+    base_result: LineupResult,
+    base_speed_delta: float,
+    protected: set[str],
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> list[EliteReplacement]:
+    """Try moving a displaced protected athlete into a synthetic sprint relay."""
+    options: list[EliteReplacement] = []
+    athlete_events = collect_athlete_events(trial_lineup, relays)
+    for relay_event in sorted(SPRINT_RELAY_EVENTS, key=event_sort_value):
+        relay = relays.get(relay_event)
+        if not relay or relay.method != "synthetic" or protected_athlete in relay.athletes:
+            continue
+        if not can_take_event(athlete_events[protected_athlete], relay_event):
+            continue
+        leg_times = relay_leg_time_map(relay_event, school, school_relay_history, school_relay_splits)
+        protected_time = leg_times.get(protected_athlete)
+        if protected_time is None:
+            continue
+        current_team = []
+        for current_athlete in relay.athletes:
+            current_time = leg_times.get(current_athlete)
+            if current_time is None:
+                break
+            current_team.append((current_athlete, current_time))
+        if len(current_team) != 4:
+            continue
+        replaceable_team = [item for item in current_team if item[0] not in protected]
+        if not replaceable_team:
+            continue
+        target_athlete, target_time = max(replaceable_team, key=lambda item: item[1])
+        if protected_time >= target_time:
+            continue
+        new_team = [(name, value) for name, value in current_team if name != target_athlete]
+        new_team.append((protected_athlete, protected_time))
+        ordered_team = order_synthetic_relay_legs(new_team)
+        ordered_times = tuple(item[1] for item in ordered_team)
+        option_relays = dict(relays)
+        option_relays[relay_event] = RelaySelection(
+            event=relay_event,
+            athletes=tuple(item[0] for item in ordered_team),  # type: ignore[arg-type]
+            projected_time=sum(ordered_times) - RELAY_SYNTHETIC_CREDIT[relay_event],
+            method="synthetic",
+            source_mark="protected elite compensation using best individual PR/relay split",
+            leg_times=ordered_times,  # type: ignore[arg-type]
+        )
+        replacement = evaluated_elite_replacement(
+            clone_lineup(trial_lineup),
+            option_relays,
+            replaced_event,
+            school,
+            opponents,
+            base_result,
+            base_speed_delta + target_time - protected_time,
+            opponent_relay_history,
+            opponent_relay_splits,
+        )
+        if replacement:
+            options.append(replacement)
+    return options
+
+
+def try_elite_relay_replacement(
+    athlete: str,
+    relay_event: str,
+    protected: set[str],
+    lineup: dict[str, list[str]],
+    relays: dict[str, RelaySelection],
+    school: list[Performance],
+    opponents: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    base_result: LineupResult,
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> EliteReplacement | None:
+    """Try replacing the slowest leg in a synthetic sprint relay with an elite athlete."""
+    relay = relays.get(relay_event)
+    if not relay or relay.method != "synthetic" or athlete in relay.athletes:
+        return None
+    athlete_events = collect_athlete_events(lineup, relays)
+    if not can_take_event(athlete_events[athlete], relay_event):
+        return None
+    leg_times = relay_leg_time_map(relay_event, school, school_relay_history, school_relay_splits)
+    candidate_time = leg_times.get(athlete)
+    if candidate_time is None:
+        return None
+    current_team = []
+    for current_athlete in relay.athletes:
+        current_time = leg_times.get(current_athlete)
+        if current_time is None:
+            return None
+        current_team.append((current_athlete, current_time))
+    replaceable_team = [item for item in current_team if item[0] not in protected]
+    if not replaceable_team:
+        return None
+    target_athlete, target_time = max(replaceable_team, key=lambda item: item[1])
+    if candidate_time >= target_time:
+        return None
+    new_team = [(name, value) for name, value in current_team if name != target_athlete]
+    new_team.append((athlete, candidate_time))
+    ordered_team = order_synthetic_relay_legs(new_team)
+    ordered_times = tuple(item[1] for item in ordered_team)
+    trial_relays = dict(relays)
+    trial_relays[relay_event] = RelaySelection(
+        event=relay_event,
+        athletes=tuple(item[0] for item in ordered_team),  # type: ignore[arg-type]
+        projected_time=sum(ordered_times) - RELAY_SYNTHETIC_CREDIT[relay_event],
+        method="synthetic",
+        source_mark="elite replacement using best individual PR/relay split",
+        leg_times=ordered_times,  # type: ignore[arg-type]
+    )
+    return evaluated_elite_replacement(
+        clone_lineup(lineup),
+        trial_relays,
+        relay_event,
+        school,
+        opponents,
+        base_result,
+        target_time - candidate_time,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+
+
+def evaluated_elite_replacement(
+    trial_lineup: dict[str, list[str]],
+    trial_relays: dict[str, RelaySelection],
+    event: str,
+    school: list[Performance],
+    opponents: list[Performance],
+    base_result: LineupResult,
+    speed_delta: float,
+    opponent_relay_history: list[RelayPerformance],
+    opponent_relay_splits: list[Performance],
+) -> EliteReplacement | None:
+    """Score a trial elite replacement and keep it only when team points do not drop."""
+    if not lineup_is_valid(trial_lineup, trial_relays):
+        return None
+    trial_result = evaluate_lineup(
+        trial_lineup,
+        trial_relays,
+        school,
+        opponents,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+    total_delta = trial_result.total_points - base_result.total_points
+    event_delta = trial_result.event_points.get(event, 0.0) - base_result.event_points.get(event, 0.0)
+    if total_delta < -0.01:
+        return None
+    if total_delta <= 0.01 and event_delta <= 0.01 and speed_delta <= 0.01:
+        return None
+    return EliteReplacement(
+        lineup=trial_lineup,
+        relays=trial_relays,
+        event=event,
+        total_delta=total_delta,
+        event_delta=event_delta,
+        speed_delta=speed_delta,
+    )
+
+
+def worst_individual_entry(
+    event: str,
+    athletes: list[str],
+    best_perf: dict[tuple[str, str], Performance],
+    protected: set[str] | None = None,
+) -> Performance | None:
+    """Return the weakest seeded athlete currently entered in an individual event."""
+    protected = protected or set()
+    entries = [best_perf.get((athlete, event)) for athlete in athletes if athlete not in protected]
+    entries = [entry for entry in entries if entry is not None]
+    if not entries:
+        return None
+    return sort_event_pool(entries, event)[-1]
+
+
+def relay_leg_time_map(
+    relay_event: str,
+    school: list[Performance],
+    relay_history: list[RelayPerformance],
+    relay_splits: list[Performance],
+) -> dict[str, float]:
+    """Map athletes to their best comparable relay-leg time."""
+    return dict(best_relay_leg_candidates(relay_event, school, relay_history, relay_splits))
 
 
 def group_school_events(
@@ -1585,6 +2203,8 @@ def lineup_is_valid(lineup: dict[str, list[str]], relays: dict[str, RelaySelecti
 def can_event_set_stand(events: list[str]) -> bool:
     """Check the full set of events for one athlete."""
     if len(events) > MAX_EVENTS_PER_ATHLETE:
+        return False
+    if {"400m", "4x400 relay"}.issubset(set(events)):
         return False
     if any(event in DISTANCE_EVENTS for event in events):
         distance_limit = 3 if {"4x800 relay", "800m"}.issubset(set(events)) else 2
@@ -2355,3 +2975,36 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
