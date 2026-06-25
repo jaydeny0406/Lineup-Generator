@@ -19,11 +19,11 @@ from urllib.request import Request, urlopen
 
 INDIVIDUAL_POINTS = [10, 8, 6, 5, 4, 3, 2, 1]
 RELAY_POINTS = [10, 8, 6, 4, 2]
-APP_VERSION = "2026.06.24-flat-sprint-elite-v12"
+APP_VERSION = "2026.06.25-event-sort-v15"
 MAX_EVENTS_PER_ATHLETE = 4
 MAX_INDIVIDUAL_ENTRIES = 3
 ELITE_ATHLETE_COUNT = 5
-MAX_ELITE_REPLACEMENTS = 20
+MAX_ELITE_REPLACEMENTS = 15
 
 RUNNING_ORDER = {
     "4x800 relay": 1,
@@ -2587,8 +2587,11 @@ HTML_PAGE = r"""
       --line: #d8e0e8;
       --surface: #ffffff;
       --band: #f6f8fb;
-      --accent: #176b87;
-      --accent-2: #b63f2f;
+      --accent: #7a1208;
+      --accent-2: #b41610;
+      --gold: #f0ac1b;
+      --highlight: #dff2ff;
+      --highlight-line: #65bdf2;
       --ok: #247a4f;
     }
     * { box-sizing: border-box; }
@@ -2640,23 +2643,71 @@ HTML_PAGE = r"""
     }
     button.secondary { background: #e8edf2; color: var(--ink); }
     button:disabled { opacity: .65; cursor: wait; }
+    .athlete-chip {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      margin: -2px 2px -2px 0;
+      padding: 2px 6px;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      font-weight: 800;
+      line-height: 1.25;
+      cursor: pointer;
+      transform-origin: center;
+      transition: transform .14s ease, background .14s ease, border-color .14s ease, box-shadow .14s ease, color .14s ease;
+    }
+    .athlete-chip:hover {
+      transform: scale(1.045);
+      background: #fff7e3;
+      border-color: rgba(240, 172, 27, .55);
+      color: var(--accent);
+      box-shadow: 0 2px 8px rgba(23, 32, 42, .12);
+    }
+    .athlete-chip.selected {
+      background: var(--highlight);
+      border-color: var(--highlight-line);
+      box-shadow: 0 0 0 3px rgba(101, 189, 242, .28);
+      color: #0b527d;
+      transform: scale(1.035);
+    }
     .division-tabs {
       display: inline-flex;
       gap: 2px;
       padding: 3px;
-      margin-bottom: 14px;
       border: 1px solid var(--line);
       border-radius: 7px;
       background: #e8edf2;
     }
+    .lineup-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
     .division-tabs[hidden] { display: none; }
-    .division-tab {
+    .event-sort {
+      display: inline-flex;
+      gap: 2px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #e8edf2;
+    }
+    .division-tab,
+    .sort-option {
       min-width: 92px;
       padding: 8px 12px;
       background: transparent;
       color: var(--ink);
     }
-    .division-tab.active {
+    .division-tab.active,
+    .sort-option.active {
       background: var(--surface);
       color: var(--accent);
       box-shadow: 0 1px 2px rgba(23, 32, 42, .12);
@@ -2693,6 +2744,104 @@ HTML_PAGE = r"""
     ol { margin: 0; padding-left: 20px; }
     li { margin: 5px 0; }
     .relay { border-left: 4px solid var(--accent-2); }
+    .athlete-panel {
+      position: fixed;
+      top: 112px;
+      right: 18px;
+      z-index: 20;
+      width: min(360px, calc(100vw - 32px));
+      max-height: calc(100vh - 136px);
+      overflow: hidden;
+      border: 1px solid rgba(122, 18, 8, .28);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: 0 18px 44px rgba(23, 32, 42, .22);
+    }
+    .athlete-panel[hidden] { display: none; }
+    .athlete-panel-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 12px 10px 14px;
+      background: var(--accent);
+      color: #fff;
+      cursor: move;
+      user-select: none;
+    }
+    .athlete-panel-title { min-width: 0; }
+    .athlete-panel-title strong {
+      display: block;
+      font-size: 1rem;
+      line-height: 1.2;
+    }
+    .athlete-panel-title span {
+      display: block;
+      margin-top: 2px;
+      color: rgba(255, 255, 255, .78);
+      font-size: .78rem;
+      font-weight: 700;
+    }
+    .athlete-panel-close {
+      flex: 0 0 auto;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border-radius: 5px;
+      background: rgba(255, 255, 255, .12);
+      color: #fff;
+      font-size: 1.1rem;
+      line-height: 1;
+    }
+    .athlete-panel-close:hover { background: rgba(255, 255, 255, .22); }
+    .athlete-panel-body {
+      max-height: calc(100vh - 200px);
+      overflow: auto;
+      padding: 12px 14px 14px;
+    }
+    .athlete-event-list {
+      display: grid;
+      gap: 9px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .athlete-event-item {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 10px;
+      background: #fbfcfe;
+    }
+    .athlete-event-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-weight: 800;
+    }
+    .athlete-event-mark {
+      color: var(--accent);
+      white-space: nowrap;
+    }
+    .athlete-event-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .athlete-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 7px;
+      background: #eef3f7;
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 800;
+    }
+    .athlete-pill.points-pill {
+      background: #e7f6ee;
+      color: var(--ok);
+    }
     .error {
       border: 1px solid #f0b7ad;
       color: #84291d;
@@ -2705,13 +2854,19 @@ HTML_PAGE = r"""
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       .summary { grid-template-columns: 1fr; }
+      .athlete-panel {
+        top: auto;
+        right: 12px;
+        bottom: 12px;
+        max-height: min(68vh, 520px);
+      }
     }
   </style>
 </head>
 <body>
   <header>
     <h1>Track Lineup Optimizer</h1>
-    <div class="version">Build 2026.06.22-injured-athletes-v9</div>
+    <div class="version">Build 2026.06.25-v15</div>
   </header>
   <main>
     <aside>
@@ -2735,9 +2890,15 @@ HTML_PAGE = r"""
       </form>
     </aside>
     <section>
-      <div id="division-tabs" class="division-tabs" hidden>
-        <button class="division-tab active" data-division="mens" type="button">Mens</button>
-        <button class="division-tab" data-division="womens" type="button">Womens</button>
+      <div class="lineup-controls">
+        <div id="division-tabs" class="division-tabs" hidden>
+          <button class="division-tab active" data-division="mens" type="button">Mens</button>
+          <button class="division-tab" data-division="womens" type="button">Womens</button>
+        </div>
+        <div id="event-sort" class="event-sort" aria-label="Event order">
+          <button class="sort-option active" data-sort="schedule" type="button">Schedule</button>
+          <button class="sort-option" data-sort="distance" type="button">Distance</button>
+        </div>
       </div>
       <div id="errors"></div>
       <div class="summary">
@@ -2748,6 +2909,18 @@ HTML_PAGE = r"""
       <div id="results" class="grid"></div>
     </section>
   </main>
+  <div id="athlete-panel" class="athlete-panel" role="dialog" aria-modal="false" aria-labelledby="athlete-panel-name" hidden>
+    <div id="athlete-panel-head" class="athlete-panel-head">
+      <div class="athlete-panel-title">
+        <strong id="athlete-panel-name">Athlete</strong>
+        <span id="athlete-panel-count">0 events</span>
+      </div>
+      <button id="athlete-panel-close" class="athlete-panel-close" type="button" aria-label="Close athlete overview">x</button>
+    </div>
+    <div class="athlete-panel-body">
+      <ul id="athlete-panel-events" class="athlete-event-list"></ul>
+    </div>
+  </div>
   <script>
     const form = document.querySelector("#optimizer-form");
     const runButton = document.querySelector("#run-button");
@@ -2755,8 +2928,32 @@ HTML_PAGE = r"""
     const results = document.querySelector("#results");
     const errors = document.querySelector("#errors");
     const divisionTabs = document.querySelector("#division-tabs");
+    const eventSortControls = document.querySelector("#event-sort");
+    const athletePanel = document.querySelector("#athlete-panel");
+    const athletePanelHead = document.querySelector("#athlete-panel-head");
+    const athletePanelName = document.querySelector("#athlete-panel-name");
+    const athletePanelCount = document.querySelector("#athlete-panel-count");
+    const athletePanelEvents = document.querySelector("#athlete-panel-events");
+    const athletePanelClose = document.querySelector("#athlete-panel-close");
+    const EVENT_SORT_ORDERS = {
+      schedule: [
+        "4x800 relay", "4x100 relay", "3200m", "110h", "100m", "800m",
+        "4x200 relay", "400m", "300h", "1600m", "200m", "4x400 relay",
+        "shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"
+      ],
+      distance: [
+        "100m", "200m", "400m", "800m", "1600m", "3200m", "110h", "300h",
+        "4x100 relay", "4x200 relay", "4x400 relay", "4x800 relay",
+        "shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"
+      ]
+    };
     let divisionResults = null;
     let activeDivision = "mens";
+    let currentResult = null;
+    let activeEventSort = "schedule";
+    let athleteIndex = new Map();
+    let selectedAthleteKey = "";
+    let panelDrag = null;
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -2769,6 +2966,18 @@ HTML_PAGE = r"""
     });
 
     demoButton.addEventListener("click", async () => optimize("/api/demo", {}));
+    results.addEventListener("click", (event) => {
+      const button = event.target.closest(".athlete-chip");
+      if (!button) return;
+      openAthletePanel(button.dataset.athleteName || button.textContent.trim());
+    });
+    athletePanelClose.addEventListener("click", closeAthletePanel);
+    athletePanelHead.addEventListener("pointerdown", startPanelDrag);
+    document.addEventListener("pointermove", dragAthletePanel);
+    document.addEventListener("pointerup", stopPanelDrag);
+    window.addEventListener("resize", () => {
+      if (!athletePanel.hidden && !panelDrag) placePanelOnSide();
+    });
     divisionTabs.addEventListener("click", (event) => {
       const button = event.target.closest("[data-division]");
       if (!button || !divisionResults) return;
@@ -2776,11 +2985,19 @@ HTML_PAGE = r"""
       updateDivisionTabs();
       renderSingle(divisionResults[activeDivision] || {});
     });
+    eventSortControls.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-sort]");
+      if (!button || button.dataset.sort === activeEventSort) return;
+      activeEventSort = button.dataset.sort;
+      updateEventSortControls();
+      if (currentResult) renderSingle(currentResult);
+    });
 
     async function optimize(url, payload) {
       runButton.disabled = true;
       results.innerHTML = "";
       errors.innerHTML = "";
+      closeAthletePanel();
       try {
         const response = await fetch(url, {
           method: "POST",
@@ -2816,7 +3033,15 @@ HTML_PAGE = r"""
       });
     }
 
-    function renderSingle(data) {
+    function updateEventSortControls() {
+      eventSortControls.querySelectorAll("[data-sort]").forEach(button => {
+        button.classList.toggle("active", button.dataset.sort === activeEventSort);
+      });
+    }
+
+    function renderSingleLegacy(data) {
+      closeAthletePanel();
+      athleteIndex = buildAthleteIndex(data);
       document.querySelector("#total-points").textContent = Number(data.total_points || 0).toFixed(1);
       document.querySelector("#school-count").textContent = data.scraped?.school_records || 0;
       document.querySelector("#opponent-count").textContent = data.scraped?.opponent_records || 0;
@@ -2844,6 +3069,177 @@ HTML_PAGE = r"""
       results.innerHTML = cards.join("") || `<div class="panel">No lineup could be generated from the parsed records.</div>`;
     }
 
+    function renderSingle(data) {
+      closeAthletePanel();
+      currentResult = data || {};
+      athleteIndex = buildAthleteIndex(currentResult);
+      document.querySelector("#total-points").textContent = Number(currentResult.total_points || 0).toFixed(1);
+      document.querySelector("#school-count").textContent = currentResult.scraped?.school_records || 0;
+      document.querySelector("#opponent-count").textContent = currentResult.scraped?.opponent_records || 0;
+      errors.innerHTML = (currentResult.errors || []).map(error => `<div class="error">${escapeHtml(error)}</div>`).join("");
+      const eventPoints = currentResult.event_points || {};
+      const cards = [];
+      for (const event of sortedEventNames(currentResult)) {
+        const entries = currentResult.lineup?.[event] || [];
+        const relay = currentResult.relays?.[event];
+        if (entries.length) cards.push(renderIndividualEventCard(event, entries, eventPoints));
+        if (relay) cards.push(renderRelayEventCard(event, relay));
+      }
+      results.innerHTML = cards.join("") || `<div class="panel">No lineup could be generated from the parsed records.</div>`;
+    }
+
+    function renderIndividualEventCard(event, entries, eventPoints) {
+      return `
+        <article class="event-card">
+          <div class="event-head"><h3>${escapeHtml(titleCase(event))}</h3><span class="points">${Number(eventPoints[event] || 0).toFixed(1)} pts</span></div>
+          <ol>${entries.map(entry => `<li>${athleteButton(entry.athlete)} ${escapeHtml(entry.adjusted_mark)} <span class="muted">(${formatPlace(entry.projected_place_label)} - ${formatPoints(entry.projected_points)} points)${entry.mark !== entry.adjusted_mark ? ` - PR ${escapeHtml(entry.mark)}` : ""}</span></li>`).join("")}</ol>
+        </article>
+      `;
+    }
+
+    function renderRelayEventCard(event, relay) {
+      return `
+        <article class="event-card relay">
+          <div class="event-head"><h3>${escapeHtml(titleCase(event))}</h3><span class="points">${Number(relay.projected_points || 0).toFixed(1)} pts</span></div>
+          <ol>${relay.athletes.map(name => `<li>${athleteButton(name)}</li>`).join("")}</ol>
+          <div class="muted">Projected ${escapeHtml(relay.projected_mark || "n/a")} - ${escapeHtml(relay.method || "relay")} ${relay.source_mark ? `from ${escapeHtml(relay.source_mark)}` : ""}</div>
+        </article>
+      `;
+    }
+
+    function sortedEventNames(data) {
+      const names = new Set();
+      for (const [event, entries] of Object.entries(data.lineup || {})) {
+        if ((entries || []).length) names.add(event);
+      }
+      for (const [event, relay] of Object.entries(data.relays || {})) {
+        if (relay) names.add(event);
+      }
+      return [...names].sort((a, b) => eventSortRank(a) - eventSortRank(b) || titleCase(a).localeCompare(titleCase(b)));
+    }
+
+    function eventSortRank(event) {
+      const order = EVENT_SORT_ORDERS[activeEventSort] || EVENT_SORT_ORDERS.schedule;
+      const rank = order.indexOf(event);
+      return rank >= 0 ? rank : 1000;
+    }
+
+    function athleteButton(name) {
+      return `<button class="athlete-chip" type="button" data-athlete-key="${escapeHtml(athleteKey(name))}" data-athlete-name="${escapeHtml(name)}">${escapeHtml(name)}</button>`;
+    }
+
+    function buildAthleteIndex(data) {
+      const index = new Map();
+      for (const [event, entries] of Object.entries(data.lineup || {})) {
+        for (const entry of entries || []) {
+          addAthleteEvent(index, entry.athlete, {
+            event,
+            mark: entry.adjusted_mark || entry.mark || "n/a",
+            place: entry.projected_place_label || "unplaced",
+            points: Number(entry.projected_points || 0),
+            type: "Individual"
+          });
+        }
+      }
+      for (const [event, relay] of Object.entries(data.relays || {})) {
+        for (const name of relay.athletes || []) {
+          addAthleteEvent(index, name, {
+            event,
+            mark: relay.projected_mark || "n/a",
+            place: relayPlaceFromPoints(Number(relay.projected_points || 0)),
+            points: Number(relay.projected_points || 0),
+            type: "Relay"
+          });
+        }
+      }
+      return index;
+    }
+
+    function addAthleteEvent(index, athlete, detail) {
+      const key = athleteKey(athlete);
+      if (!index.has(key)) index.set(key, {name: athlete, events: []});
+      index.get(key).events.push(detail);
+    }
+
+    function openAthletePanel(name) {
+      const key = athleteKey(name);
+      const athlete = athleteIndex.get(key);
+      if (!athlete) return;
+      selectedAthleteKey = key;
+      highlightAthlete();
+      athletePanelName.textContent = athlete.name;
+      athletePanelCount.textContent = `${athlete.events.length} ${athlete.events.length === 1 ? "event" : "events"}`;
+      const athleteEvents = [...athlete.events].sort((a, b) => eventSortRank(a.event) - eventSortRank(b.event) || titleCase(a.event).localeCompare(titleCase(b.event)));
+      athletePanelEvents.innerHTML = athleteEvents.map(detail => `
+        <li class="athlete-event-item">
+          <div class="athlete-event-top">
+            <span>${escapeHtml(titleCase(detail.event))}</span>
+            <span class="athlete-event-mark">${escapeHtml(detail.mark)}</span>
+          </div>
+          <div class="athlete-event-meta">
+            <span class="athlete-pill">${escapeHtml(detail.type)}</span>
+            <span class="athlete-pill">${formatPlace(detail.place)}</span>
+            <span class="athlete-pill points-pill">${formatPoints(detail.points)} pts</span>
+          </div>
+        </li>
+      `).join("");
+      athletePanel.hidden = false;
+      document.body.classList.add("athlete-panel-open");
+      placePanelOnSide();
+    }
+
+    function closeAthletePanel() {
+      selectedAthleteKey = "";
+      highlightAthlete();
+      athletePanel.hidden = true;
+      document.body.classList.remove("athlete-panel-open");
+      panelDrag = null;
+    }
+
+    function highlightAthlete() {
+      results.querySelectorAll(".athlete-chip").forEach(button => {
+        button.classList.toggle("selected", Boolean(selectedAthleteKey) && button.dataset.athleteKey === selectedAthleteKey);
+      });
+    }
+
+    function placePanelOnSide() {
+      if (athletePanel.hidden) return;
+      const width = athletePanel.offsetWidth || 360;
+      const height = athletePanel.offsetHeight || 420;
+      athletePanel.style.left = `${Math.max(12, window.innerWidth - width - 18)}px`;
+      athletePanel.style.top = `${window.innerWidth <= 880 ? Math.max(12, window.innerHeight - height - 12) : 112}px`;
+      athletePanel.style.right = "auto";
+      athletePanel.style.bottom = "auto";
+    }
+
+    function startPanelDrag(event) {
+      if (event.target.closest(".athlete-panel-close")) return;
+      const rect = athletePanel.getBoundingClientRect();
+      panelDrag = {
+        pointerId: event.pointerId,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top
+      };
+      athletePanelHead.setPointerCapture(event.pointerId);
+    }
+
+    function dragAthletePanel(event) {
+      if (!panelDrag || event.pointerId !== panelDrag.pointerId) return;
+      const width = athletePanel.offsetWidth;
+      const height = athletePanel.offsetHeight;
+      const left = Math.min(Math.max(8, event.clientX - panelDrag.offsetX), Math.max(8, window.innerWidth - width - 8));
+      const top = Math.min(Math.max(8, event.clientY - panelDrag.offsetY), Math.max(8, window.innerHeight - height - 8));
+      athletePanel.style.left = `${left}px`;
+      athletePanel.style.top = `${top}px`;
+      athletePanel.style.right = "auto";
+      athletePanel.style.bottom = "auto";
+    }
+
+    function stopPanelDrag(event) {
+      if (!panelDrag || event.pointerId !== panelDrag.pointerId) return;
+      panelDrag = null;
+    }
+
     function titleCase(value) {
       return value.replace(/\b\w/g, letter => letter.toUpperCase()).replace("Relay", "Relay");
     }
@@ -2855,6 +3251,15 @@ HTML_PAGE = r"""
 
     function formatPlace(label) {
       return label && label !== "unplaced" ? `${escapeHtml(label)} place` : "unplaced";
+    }
+
+    function relayPlaceFromPoints(points) {
+      const places = {10: "1st", 8: "2nd", 6: "3rd", 4: "4th", 2: "5th"};
+      return places[points] || "unplaced";
+    }
+
+    function athleteKey(value) {
+      return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
     }
 
     function escapeHtml(value) {
@@ -2975,21 +3380,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

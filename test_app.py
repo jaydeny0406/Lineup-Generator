@@ -301,6 +301,23 @@ class OptimizerTests(unittest.TestCase):
         self.assertIn('id="injured-athletes"', app.HTML_PAGE)
         self.assertIn("injuredAthletes:", app.HTML_PAGE)
 
+    def test_ui_includes_clickable_athlete_panel(self):
+        self.assertIn('id="athlete-panel"', app.HTML_PAGE)
+        self.assertIn("athlete-chip", app.HTML_PAGE)
+        self.assertIn("openAthletePanel", app.HTML_PAGE)
+        self.assertIn("buildAthleteIndex", app.HTML_PAGE)
+        self.assertNotIn("body.athlete-panel-open section", app.HTML_PAGE)
+
+    def test_ui_includes_event_sort_options(self):
+        self.assertIn('id="event-sort"', app.HTML_PAGE)
+        self.assertIn('data-sort="schedule"', app.HTML_PAGE)
+        self.assertIn('data-sort="distance"', app.HTML_PAGE)
+        self.assertIn("sortedEventNames", app.HTML_PAGE)
+        self.assertIn('"4x800 relay", "4x100 relay", "3200m", "110h"', app.HTML_PAGE)
+        self.assertIn('"shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"', app.HTML_PAGE)
+        self.assertIn('"100m", "200m", "400m", "800m", "1600m", "3200m", "110h", "300h"', app.HTML_PAGE)
+        self.assertIn('"4x100 relay", "4x200 relay", "4x400 relay", "4x800 relay"', app.HTML_PAGE)
+
     def test_both_mode_keeps_divisions_separate(self):
         mens_result = app.LineupResult(
             lineup={"100m": [{"athlete": "Mens Runner"}]},
