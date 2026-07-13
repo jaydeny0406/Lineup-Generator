@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import re
 import sys
 import traceback
@@ -19,7 +20,7 @@ from urllib.request import Request, urlopen
 
 INDIVIDUAL_POINTS = [10, 8, 6, 5, 4, 3, 2, 1]
 RELAY_POINTS = [10, 8, 6, 4, 2]
-APP_VERSION = "2026.06.25-event-sort-v15"
+APP_VERSION = "2026.07.07-team-title-source-v22"
 MAX_EVENTS_PER_ATHLETE = 4
 MAX_INDIVIDUAL_ENTRIES = 3
 ELITE_ATHLETE_COUNT = 5
@@ -57,12 +58,15 @@ RELAY_BASE_EVENT = {
 
 RELAY_EVENT_FOR_BASE = {base_event: relay_event for relay_event, base_event in RELAY_BASE_EVENT.items()}
 
-RELAY_SYNTHETIC_CREDIT = {
-    "4x100 relay": 2.7,
-    "4x200 relay": 3.0,
-    "4x400 relay": 3.0,
-    "4x800 relay": 2.0,
+RELAY_INDIVIDUAL_EXCHANGE_CREDIT = {
+    "4x100 relay": 0.7,
+    "4x200 relay": 0.7,
+    "4x400 relay": 0.6,
+    "4x800 relay": 0.5,
 }
+
+INDIVIDUAL_LEG_SOURCE = "individual"
+RELAY_SPLIT_LEG_SOURCE = "relay_split"
 
 HISTORIC_RELAY_IMPROVEMENT = {
     "4x100 relay": 0.2,
@@ -103,6 +107,7 @@ class RelaySelection:
     method: str
     source_mark: str
     leg_times: tuple[float, float, float, float] | None = None
+    leg_sources: tuple[str, str, str, str] | None = None
 
 
 @dataclass
@@ -127,6 +132,8 @@ class LineupResult:
     total_points: float
     scraped: dict[str, int]
     errors: list[str]
+    event_standings: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    edit_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -212,7 +219,7 @@ def parse_athletic_team_url(url: str) -> tuple[str, int, str]:
     """Extract team ID, API season ID, and canonical URL from an event-records link."""
     canonical = normalize_athletic_url(url)
     match = re.search(
-        r"/team/(\d+)/track-and-field-(outdoor|indoor)/(\d{4})/event-records(?:/|$)",
+        r"/team/(\d+)/track-and-field-(outdoor|indoor)/(\d{4})(?:/event-records)?(?:/|$)",
         urlparse(canonical).path,
         flags=re.I,
     )
@@ -223,6 +230,8 @@ def parse_athletic_team_url(url: str) -> tuple[str, int, str]:
         )
     team_id, season_type, year = match.groups()
     season_id = int(year) + (10000 if season_type.lower() == "indoor" else 0)
+    if not urlparse(canonical).path.rstrip("/").endswith("/event-records"):
+        canonical = canonical.rstrip("/") + "/event-records"
     return team_id, season_id, canonical
 
 
@@ -273,7 +282,7 @@ def scrape_team_data(
 ) -> ScrapeResult:
     """Scrape individual records and historic relay teams from an event-records page."""
     team_id, season_id, canonical_url = parse_athletic_team_url(url)
-    source_name = source or canonical_url
+    source_name = resolve_athletic_team_name(canonical_url) or source or canonical_url
     errors: list[str] = []
 
     try:
@@ -297,7 +306,7 @@ def scrape_team_data(
             errors.append(f"Reader fallback failed: {exc}")
 
     for page in page_candidates:
-        page_source = source or extract_team_name(page) or canonical_url
+        page_source = extract_team_name(page) or source or canonical_url
         performances, relay_history = parse_athletic_records_html(page, page_source, team_role, gender)
         if performances:
             return ScrapeResult(performances, relay_history)
@@ -307,10 +316,35 @@ def scrape_team_data(
     )
 
 
+def resolve_athletic_team_name(canonical_url: str) -> str | None:
+    """Fetch the Athletic.net team page title so standings show real school names."""
+    base_url = re.sub(r"/event-records/?$", "", canonical_url)
+    candidate_urls = [canonical_url]
+    if base_url != canonical_url:
+        candidate_urls.append(base_url)
+    for url in candidate_urls:
+        try:
+            name = extract_team_name(fetch_text_url(url))
+        except Exception:
+            name = None
+        if name:
+            return name
+    for url in candidate_urls:
+        for reader_url in athletic_reader_urls(url):
+            try:
+                name = extract_team_name(fetch_text_url(reader_url))
+            except Exception:
+                name = None
+            if name:
+                return name
+    return None
+
+
 def parse_athletic_api_data(
     payload: dict[str, Any], source: str, team_role: str, gender: str = "mens"
 ) -> ScrapeResult:
     """Parse Athletic.net's first-party event-records JSON response."""
+    source_name = extract_athletic_api_team_name(payload) or source
     records = payload.get("eventRecords")
     relay_members = payload.get("relayMembers")
     if not isinstance(records, list):
@@ -355,7 +389,7 @@ def parse_athletic_api_data(
                     mark=mark,
                     value=parsed[0],
                     is_time=True,
-                    source=source,
+                    source=source_name,
                     team_role=team_role,
                 )
             )
@@ -372,7 +406,7 @@ def parse_athletic_api_data(
                     mark=mark,
                     value=parsed[0],
                     is_time=parsed[1],
-                    source=source,
+                    source=source_name,
                     team_role=team_role,
                 )
             )
@@ -402,7 +436,7 @@ def parse_athletic_api_data(
                 athletes=tuple(athlete_names[:4]),  # type: ignore[arg-type]
                 mark=mark,
                 value=parsed[0],
-                source=source,
+                source=source_name,
                 team_role=team_role,
             )
         )
@@ -420,6 +454,83 @@ def api_athlete_name(record: dict[str, Any]) -> str | None:
     last = clean_text(str(record.get("LastName") or ""))
     candidate = clean_text(f"{first} {last}")
     return candidate if is_name_like(candidate) else None
+
+
+def extract_athletic_api_team_name(payload: dict[str, Any]) -> str | None:
+    """Find a readable team/school name in Athletic.net's event-records JSON."""
+    preferred_containers = [
+        "team",
+        "Team",
+        "school",
+        "School",
+        "teamInfo",
+        "TeamInfo",
+        "teamProfile",
+        "TeamProfile",
+        "preferences",
+        "Preferences",
+    ]
+    for key in preferred_containers:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            name = team_name_from_mapping(value)
+            if name:
+                return name
+    return team_name_from_mapping(payload, allow_generic_name=False) or nested_team_name(payload)
+
+
+def nested_team_name(value: Any, depth: int = 0) -> str | None:
+    """Search shallow nested metadata dictionaries while skipping record lists."""
+    if depth > 3 or not isinstance(value, dict):
+        return None
+    for key, child in value.items():
+        if key in {"eventRecords", "relayMembers"} or isinstance(child, list):
+            continue
+        if not isinstance(child, dict):
+            continue
+        name = team_name_from_mapping(child)
+        if name:
+            return name
+        nested = nested_team_name(child, depth + 1)
+        if nested:
+            return nested
+    return None
+
+
+def team_name_from_mapping(data: dict[str, Any], allow_generic_name: bool = True) -> str | None:
+    """Read likely team-name fields from one Athletic.net metadata object."""
+    for key, value in data.items():
+        key_text = str(key).lower()
+        if ("team" in key_text or "school" in key_text) and any(
+            token in key_text for token in ("name", "title", "display")
+        ):
+            name = clean_team_name(value)
+            if name:
+                return name
+    if allow_generic_name:
+        for key in ("DisplayName", "displayName", "FullName", "fullName", "Name", "name", "Title", "title"):
+            if key in data:
+                name = clean_team_name(data.get(key))
+                if name:
+                    return name
+    return None
+
+
+def clean_team_name(value: Any) -> str | None:
+    """Normalize a raw Athletic.net team label for standings display."""
+    name = clean_text(str(value or ""))
+    if not name or name.lower() in {"none", "null", "true", "false"}:
+        return None
+    if re.match(r"^https?://", name, flags=re.I) or re.fullmatch(r"\d+", name):
+        return None
+    name = re.split(r"\s*\|\s*", name, maxsplit=1)[0]
+    name = re.sub(r"\s+-\s+Athletic\.net.*$", "", name, flags=re.I)
+    name = re.sub(r"\s+-\s+(?:High School\s+)?Track\s*(?:&|and)\s*Field.*$", "", name, flags=re.I)
+    name = re.sub(r"\s+Track\s*(?:&|and)\s*Field.*$", "", name, flags=re.I)
+    name = name.strip(" -")
+    if len(name) < 2 or len(name) > 90:
+        return None
+    return name
 
 
 def relay_split_base_event(event_name: str) -> str | None:
@@ -442,10 +553,21 @@ def relay_split_base_event(event_name: str) -> str | None:
 def extract_team_name(page: str) -> str | None:
     """Pull a readable team name from the HTML title when it is available."""
     title_match = re.search(r"<title[^>]*>(.*?)</title>", page, flags=re.I | re.S)
-    if not title_match:
-        return None
-    title = clean_text(title_match.group(1))
-    return title.split("|")[0].strip() if title else None
+    if title_match:
+        name = clean_team_name(title_match.group(1))
+        if name:
+            return name
+    for pattern in (
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r"^\s*Title:\s*([^\r\n]+)",
+    ):
+        match = re.search(pattern, page, flags=re.I | re.M | re.S)
+        if match:
+            name = clean_team_name(match.group(1))
+            if name:
+                return name
+    return None
 
 
 def parse_athletic_records_html(
@@ -1160,30 +1282,32 @@ def force_depth_relay(
     potentials: dict[tuple[str, str], float],
 ) -> RelaySelection | None:
     """Free low-cost individual assignments to guarantee a four-person relay."""
-    candidates = best_relay_leg_candidates(relay_event, school, relay_history, relay_splits)
-    options: list[tuple[float, int, float, str, list[str]]] = []
-    for athlete, leg_time in candidates:
+    candidates = best_relay_leg_candidates_with_sources(relay_event, school, relay_history, relay_splits)
+    options: list[tuple[float, int, float, str, str, list[str]]] = []
+    for athlete, leg_time, leg_source in candidates:
         removals = minimum_event_removals(athlete_events[athlete], relay_event)
         if removals is None:
             continue
         cost = sum(potentials.get((athlete, event), 0.0) for event in removals)
-        options.append((cost, len(removals), leg_time, athlete, removals))
+        options.append((cost, len(removals), leg_time, athlete, leg_source, removals))
     if len(options) < 4:
         return None
     chosen = sorted(options, key=lambda item: (item[0], item[1], item[2]))[:4]
-    team: list[tuple[str, float]] = []
-    for _cost, _count, leg_time, athlete, removals in chosen:
+    team: list[tuple[str, float, str]] = []
+    for _cost, _count, leg_time, athlete, leg_source, removals in chosen:
         remove_athlete_events(lineup, athlete_events, athlete, removals)
-        team.append((athlete, leg_time))
+        team.append((athlete, leg_time, leg_source))
     ordered_team = order_synthetic_relay_legs(team)
     leg_times = tuple(item[1] for item in ordered_team)
+    leg_sources = tuple(item[2] for item in ordered_team)
     return RelaySelection(
         event=relay_event,
         athletes=tuple(item[0] for item in ordered_team),  # type: ignore[arg-type]
-        projected_time=sum(leg_times) - RELAY_SYNTHETIC_CREDIT[relay_event],
+        projected_time=synthetic_relay_time(relay_event, leg_times, leg_sources),
         method="synthetic",
         source_mark="completion depth relay",
         leg_times=leg_times,  # type: ignore[arg-type]
+        leg_sources=leg_sources,  # type: ignore[arg-type]
     )
 
 
@@ -1633,36 +1757,40 @@ def compensated_relay_options(
             continue
         if not can_take_event(athlete_events[protected_athlete], relay_event):
             continue
-        leg_times = relay_leg_time_map(relay_event, school, school_relay_history, school_relay_splits)
-        protected_time = leg_times.get(protected_athlete)
-        if protected_time is None:
+        leg_candidates = relay_leg_candidate_map(relay_event, school, school_relay_history, school_relay_splits)
+        protected_leg = leg_candidates.get(protected_athlete)
+        if protected_leg is None:
             continue
+        protected_time, protected_source = protected_leg
         current_team = []
         for current_athlete in relay.athletes:
-            current_time = leg_times.get(current_athlete)
-            if current_time is None:
+            current_leg = leg_candidates.get(current_athlete)
+            if current_leg is None:
                 break
-            current_team.append((current_athlete, current_time))
+            current_time, current_source = current_leg
+            current_team.append((current_athlete, current_time, current_source))
         if len(current_team) != 4:
             continue
         replaceable_team = [item for item in current_team if item[0] not in protected]
         if not replaceable_team:
             continue
-        target_athlete, target_time = max(replaceable_team, key=lambda item: item[1])
+        target_athlete, target_time, _target_source = max(replaceable_team, key=lambda item: item[1])
         if protected_time >= target_time:
             continue
-        new_team = [(name, value) for name, value in current_team if name != target_athlete]
-        new_team.append((protected_athlete, protected_time))
+        new_team = [(name, value, source) for name, value, source in current_team if name != target_athlete]
+        new_team.append((protected_athlete, protected_time, protected_source))
         ordered_team = order_synthetic_relay_legs(new_team)
         ordered_times = tuple(item[1] for item in ordered_team)
+        ordered_sources = tuple(item[2] for item in ordered_team)
         option_relays = dict(relays)
         option_relays[relay_event] = RelaySelection(
             event=relay_event,
             athletes=tuple(item[0] for item in ordered_team),  # type: ignore[arg-type]
-            projected_time=sum(ordered_times) - RELAY_SYNTHETIC_CREDIT[relay_event],
+            projected_time=synthetic_relay_time(relay_event, ordered_times, ordered_sources),
             method="synthetic",
             source_mark="protected elite compensation using best individual PR/relay split",
             leg_times=ordered_times,  # type: ignore[arg-type]
+            leg_sources=ordered_sources,  # type: ignore[arg-type]
         )
         replacement = evaluated_elite_replacement(
             clone_lineup(trial_lineup),
@@ -1701,34 +1829,38 @@ def try_elite_relay_replacement(
     athlete_events = collect_athlete_events(lineup, relays)
     if not can_take_event(athlete_events[athlete], relay_event):
         return None
-    leg_times = relay_leg_time_map(relay_event, school, school_relay_history, school_relay_splits)
-    candidate_time = leg_times.get(athlete)
-    if candidate_time is None:
+    leg_candidates = relay_leg_candidate_map(relay_event, school, school_relay_history, school_relay_splits)
+    candidate_leg = leg_candidates.get(athlete)
+    if candidate_leg is None:
         return None
+    candidate_time, candidate_source = candidate_leg
     current_team = []
     for current_athlete in relay.athletes:
-        current_time = leg_times.get(current_athlete)
-        if current_time is None:
+        current_leg = leg_candidates.get(current_athlete)
+        if current_leg is None:
             return None
-        current_team.append((current_athlete, current_time))
+        current_time, current_source = current_leg
+        current_team.append((current_athlete, current_time, current_source))
     replaceable_team = [item for item in current_team if item[0] not in protected]
     if not replaceable_team:
         return None
-    target_athlete, target_time = max(replaceable_team, key=lambda item: item[1])
+    target_athlete, target_time, _target_source = max(replaceable_team, key=lambda item: item[1])
     if candidate_time >= target_time:
         return None
-    new_team = [(name, value) for name, value in current_team if name != target_athlete]
-    new_team.append((athlete, candidate_time))
+    new_team = [(name, value, source) for name, value, source in current_team if name != target_athlete]
+    new_team.append((athlete, candidate_time, candidate_source))
     ordered_team = order_synthetic_relay_legs(new_team)
     ordered_times = tuple(item[1] for item in ordered_team)
+    ordered_sources = tuple(item[2] for item in ordered_team)
     trial_relays = dict(relays)
     trial_relays[relay_event] = RelaySelection(
         event=relay_event,
         athletes=tuple(item[0] for item in ordered_team),  # type: ignore[arg-type]
-        projected_time=sum(ordered_times) - RELAY_SYNTHETIC_CREDIT[relay_event],
+        projected_time=synthetic_relay_time(relay_event, ordered_times, ordered_sources),
         method="synthetic",
         source_mark="elite replacement using best individual PR/relay split",
         leg_times=ordered_times,  # type: ignore[arg-type]
+        leg_sources=ordered_sources,  # type: ignore[arg-type]
     )
     return evaluated_elite_replacement(
         clone_lineup(lineup),
@@ -1804,6 +1936,24 @@ def relay_leg_time_map(
 ) -> dict[str, float]:
     """Map athletes to their best comparable relay-leg time."""
     return dict(best_relay_leg_candidates(relay_event, school, relay_history, relay_splits))
+
+
+def relay_leg_candidate_map(
+    relay_event: str,
+    school: list[Performance],
+    relay_history: list[RelayPerformance],
+    relay_splits: list[Performance],
+) -> dict[str, tuple[float, str]]:
+    """Map athletes to their best comparable relay-leg time and source type."""
+    return {
+        athlete: (value, source)
+        for athlete, value, source in best_relay_leg_candidates_with_sources(
+            relay_event,
+            school,
+            relay_history,
+            relay_splits,
+        )
+    }
 
 
 def group_school_events(
@@ -1929,10 +2079,11 @@ def relay_selection_time_for_build(
         avg_fatigue = sum(fatigue_factor(len(athlete_events[athlete])) for athlete in selection.athletes) / 4
         return selection.projected_time * avg_fatigue
     if selection.leg_times:
-        return sum(
+        adjusted_leg_times = tuple(
             leg_time * fatigue_factor(len(athlete_events[athlete]))
             for athlete, leg_time in zip(selection.athletes, selection.leg_times)
-        ) - RELAY_SYNTHETIC_CREDIT[selection.event]
+        )
+        return synthetic_relay_time(selection.event, adjusted_leg_times, selection.leg_sources)
     return selection.projected_time
 
 
@@ -1945,15 +2096,15 @@ def synthesize_relay(
     prefer_depth: bool = False,
 ) -> RelaySelection | None:
     """Create a relay using each athlete's faster individual PR or recorded relay split."""
-    candidates = best_relay_leg_candidates(
+    candidates = best_relay_leg_candidates_with_sources(
         relay_event,
         school,
         school_relay_history or [],
         school_relay_splits or [],
     )
     available = [
-        (athlete, leg_time)
-        for athlete, leg_time in candidates
+        (athlete, leg_time, leg_source)
+        for athlete, leg_time, leg_source in candidates
         if can_take_event(athlete_events[athlete], relay_event)
     ]
     if prefer_depth and len(available) >= 4:
@@ -1963,13 +2114,14 @@ def synthesize_relay(
         team = available[:4]
     if len(team) < 4:
         return None
-    for athlete, _leg_time in team:
+    for athlete, _leg_time, _leg_source in team:
         if can_take_event(athlete_events[athlete], relay_event):
             continue
     ordered_team = order_synthetic_relay_legs(team)
     athletes = tuple(item[0] for item in ordered_team)
     leg_times = tuple(item[1] for item in ordered_team)
-    time_value = sum(leg_times) - RELAY_SYNTHETIC_CREDIT[relay_event]
+    leg_sources = tuple(item[2] for item in ordered_team)
+    time_value = synthetic_relay_time(relay_event, leg_times, leg_sources)
     return RelaySelection(
         event=relay_event,
         athletes=athletes,  # type: ignore[arg-type]
@@ -1981,6 +2133,7 @@ def synthesize_relay(
             else "best individual PR/relay split"
         ),
         leg_times=leg_times,  # type: ignore[arg-type]
+        leg_sources=leg_sources,  # type: ignore[arg-type]
     )
 
 
@@ -1991,15 +2144,33 @@ def best_relay_leg_candidates(
     relay_splits: list[Performance] | None = None,
 ) -> list[tuple[str, float]]:
     """Return athletes ranked by their fastest comparable individual time or relay split."""
+    return [
+        (athlete, value)
+        for athlete, value, _source in best_relay_leg_candidates_with_sources(
+            relay_event,
+            school,
+            relay_history,
+            relay_splits,
+        )
+    ]
+
+
+def best_relay_leg_candidates_with_sources(
+    relay_event: str,
+    school: list[Performance],
+    relay_history: list[RelayPerformance],
+    relay_splits: list[Performance] | None = None,
+) -> list[tuple[str, float, str]]:
+    """Return athletes ranked by comparable relay-leg time with value source."""
     base_event = RELAY_BASE_EVENT[relay_event]
-    best: dict[str, tuple[str, float]] = {}
+    best: dict[str, tuple[str, float, str]] = {}
     for perf in school:
         if perf.event != base_event:
             continue
         key = perf.athlete.lower()
         current = best.get(key)
         if not current or perf.value < current[1]:
-            best[key] = (perf.athlete, perf.value)
+            best[key] = (perf.athlete, perf.value, INDIVIDUAL_LEG_SOURCE)
     for relay in relay_history:
         if relay.event != relay_event:
             continue
@@ -2008,24 +2179,40 @@ def best_relay_leg_candidates(
                 continue
             key = athlete.lower()
             current = best.get(key)
-            if not current or split < current[1]:
-                best[key] = (athlete, split)
+            if not current or split < current[1] or (split == current[1] and current[2] == INDIVIDUAL_LEG_SOURCE):
+                best[key] = (athlete, split, RELAY_SPLIT_LEG_SOURCE)
     for split in relay_splits or []:
         if split.event != base_event:
             continue
         key = split.athlete.lower()
         current = best.get(key)
-        if not current or split.value < current[1]:
-            best[key] = (split.athlete, split.value)
+        if not current or split.value < current[1] or (split.value == current[1] and current[2] == INDIVIDUAL_LEG_SOURCE):
+            best[key] = (split.athlete, split.value, RELAY_SPLIT_LEG_SOURCE)
     return sorted(best.values(), key=lambda item: item[1])
 
 
-def order_synthetic_relay_legs(team: list[tuple[str, float]]) -> list[tuple[str, float]]:
+def order_synthetic_relay_legs(team: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
     """Order four synthetic legs as second, third, slowest, fastest."""
     ranked = sorted(team, key=lambda item: item[1])
     if len(ranked) != 4:
         return ranked
     return [ranked[1], ranked[2], ranked[3], ranked[0]]
+
+
+def synthetic_relay_credit(relay_event: str, leg_sources: tuple[str, ...] | None, leg_count: int) -> float:
+    """Credit only relay legs based on individual PRs, not already-recorded relay splits."""
+    sources = leg_sources or tuple(INDIVIDUAL_LEG_SOURCE for _ in range(leg_count))
+    per_individual = RELAY_INDIVIDUAL_EXCHANGE_CREDIT[relay_event]
+    return sum(per_individual for source in sources[:leg_count] if source == INDIVIDUAL_LEG_SOURCE)
+
+
+def synthetic_relay_time(
+    relay_event: str,
+    leg_times: tuple[float, ...] | list[float],
+    leg_sources: tuple[str, ...] | None = None,
+) -> float:
+    """Estimate synthetic relay time from leg values and individual-leg exchange credit."""
+    return sum(leg_times) - synthetic_relay_credit(relay_event, leg_sources, len(leg_times))
 
 
 def historic_relay_time(relay: RelayPerformance) -> float:
@@ -2035,11 +2222,15 @@ def historic_relay_time(relay: RelayPerformance) -> float:
 
 def relay_time(relay_event: str, legs: list[Performance], adjustments: dict[str, float] | None = None) -> float:
     """Estimate relay time as four PRs minus exchange credit."""
-    total = 0.0
+    leg_times = []
     for perf in legs[:4]:
         factor = adjustments.get(perf.athlete, 1.0) if adjustments else 1.0
-        total += perf.value * factor
-    return total - RELAY_SYNTHETIC_CREDIT[relay_event]
+        leg_times.append(perf.value * factor)
+    return synthetic_relay_time(
+        relay_event,
+        leg_times,
+        tuple(INDIVIDUAL_LEG_SOURCE for _ in leg_times),
+    )
 
 
 def projected_relay_points(
@@ -2100,14 +2291,20 @@ def estimate_opponent_relays(
         if source in recorded_by_source:
             estimates.append(recorded_by_source[source])
             continue
-        candidates = best_relay_leg_candidates(
+        candidates = best_relay_leg_candidates_with_sources(
             relay_event,
             by_source.get(source, []),
             [],
             split_by_source.get(source, []),
         )[:4]
         if len(candidates) == 4:
-            estimates.append(sum(value for _athlete, value in candidates) - RELAY_SYNTHETIC_CREDIT[relay_event])
+            estimates.append(
+                synthetic_relay_time(
+                    relay_event,
+                    tuple(value for _athlete, value, _source in candidates),
+                    tuple(source for _athlete, _value, source in candidates),
+                )
+            )
     return estimates
 
 
@@ -2225,6 +2422,7 @@ def evaluate_lineup(
     """Apply fatigue, simulate every event, and return projected team points."""
     best_perf = {(perf.athlete, perf.event): perf for perf in school}
     event_points: dict[str, float] = {}
+    event_standings: dict[str, list[dict[str, Any]]] = {}
     output_lineup: dict[str, list[dict[str, Any]]] = {}
     athlete_history: dict[str, list[str]] = defaultdict(list)
 
@@ -2237,6 +2435,7 @@ def evaluate_lineup(
             adjusted_value = apply_fatigue(perf.value, perf.is_time, len(athlete_history[athlete]))
             entrants.append(make_adjusted_perf(perf, adjusted_value))
         event_points[event], athlete_details = score_event_details(event, entrants, opponents)
+        event_standings[event] = projected_event_standings(event, entrants, opponents)
         output_lineup[event] = [
             entry_to_dict(perf, athlete_details.get(perf.athlete))
             for perf in sort_event_pool(entrants, event)
@@ -2261,9 +2460,13 @@ def evaluate_lineup(
         relay_output[event] = {
             "athletes": list(relay.athletes),
             "projected_mark": format_time(time_value) if math.isfinite(time_value) else "n/a",
+            "projected_seconds": round(time_value, 4) if math.isfinite(time_value) else None,
+            "raw_projected_seconds": round(relay.projected_time, 4) if math.isfinite(relay.projected_time) else None,
             "projected_points": points,
             "method": relay.method,
             "source_mark": relay.source_mark,
+            "leg_times": list(relay.leg_times) if relay.leg_times else [],
+            "leg_sources": list(relay.leg_sources) if relay.leg_sources else [],
         }
         for athlete in relay.athletes:
             athlete_history[athlete].append(event)
@@ -2276,7 +2479,214 @@ def evaluate_lineup(
         total_points=total,
         scraped={"school_records": len(school), "opponent_records": len(opponents)},
         errors=[],
+        event_standings=event_standings,
     )
+
+
+def attach_edit_context(
+    result: LineupResult,
+    school: list[Performance],
+    opponents: list[Performance],
+    school_relay_history: list[RelayPerformance] | None = None,
+    opponent_relay_history: list[RelayPerformance] | None = None,
+    school_relay_splits: list[Performance] | None = None,
+    opponent_relay_splits: list[Performance] | None = None,
+) -> LineupResult:
+    """Attach compact source data needed for coach edits and rescoring."""
+    result.edit_context = build_edit_context(
+        school,
+        opponents,
+        school_relay_history or [],
+        opponent_relay_history or [],
+        school_relay_splits or [],
+        opponent_relay_splits or [],
+    )
+    return result
+
+
+def build_edit_context(
+    school: list[Performance],
+    opponents: list[Performance],
+    school_relay_history: list[RelayPerformance],
+    opponent_relay_history: list[RelayPerformance],
+    school_relay_splits: list[Performance],
+    opponent_relay_splits: list[Performance],
+) -> dict[str, Any]:
+    """Build the data package the UI uses for manual lineup edits."""
+    relay_leg_values = {
+        event: {
+            athlete: round(value, 4)
+            for athlete, value in best_relay_leg_candidates(event, school, school_relay_history, school_relay_splits)
+        }
+        for event in RELAY_EVENTS
+    }
+    return {
+        "events": EVENTS,
+        "schedule_order": [
+            "4x800 relay", "4x100 relay", "3200m", "110h", "100m", "800m",
+            "4x200 relay", "400m", "300h", "1600m", "200m", "4x400 relay",
+            "shot put", "discus", "high jump", "pole vault", "long jump", "triple jump",
+        ],
+        "distance_order": [
+            "100m", "200m", "400m", "800m", "1600m", "3200m", "110h", "300h",
+            "4x100 relay", "4x200 relay", "4x400 relay", "4x800 relay",
+            "shot put", "discus", "high jump", "pole vault", "long jump", "triple jump",
+        ],
+        "running_order": RUNNING_ORDER,
+        "relay_events": sorted(RELAY_EVENTS),
+        "field_events": sorted(FIELD_EVENTS),
+        "distance_events": sorted(DISTANCE_EVENTS),
+        "max_events_per_athlete": MAX_EVENTS_PER_ATHLETE,
+        "max_individual_entries": MAX_INDIVIDUAL_ENTRIES,
+        "school_performances": [performance_to_dict(perf) for perf in school],
+        "opponent_performances": [performance_to_dict(perf) for perf in opponents],
+        "school_relay_history": [relay_performance_to_dict(relay) for relay in school_relay_history],
+        "opponent_relay_history": [relay_performance_to_dict(relay) for relay in opponent_relay_history],
+        "school_relay_splits": [performance_to_dict(perf) for perf in school_relay_splits],
+        "opponent_relay_splits": [performance_to_dict(perf) for perf in opponent_relay_splits],
+        "relay_leg_values": relay_leg_values,
+    }
+
+
+def performance_to_dict(perf: Performance) -> dict[str, Any]:
+    """Serialize one performance for browser-side coach edits."""
+    return {
+        "athlete": perf.athlete,
+        "event": perf.event,
+        "mark": perf.mark,
+        "value": perf.value,
+        "is_time": perf.is_time,
+        "source": perf.source,
+        "team_role": perf.team_role,
+    }
+
+
+def performance_from_dict(data: dict[str, Any]) -> Performance:
+    """Restore a serialized performance from an edit payload."""
+    return Performance(
+        clean_text(data.get("athlete", "")),
+        clean_text(data.get("event", "")),
+        clean_text(data.get("mark", "")),
+        float(data.get("value", 0.0)),
+        bool(data.get("is_time", True)),
+        clean_text(data.get("source", "")),
+        clean_text(data.get("team_role", "")),
+    )
+
+
+def relay_performance_to_dict(relay: RelayPerformance) -> dict[str, Any]:
+    """Serialize one recorded relay for edit rescoring."""
+    return {
+        "event": relay.event,
+        "athletes": list(relay.athletes),
+        "mark": relay.mark,
+        "value": relay.value,
+        "source": relay.source,
+        "team_role": relay.team_role,
+        "splits": list(relay.splits),
+        "method": relay.method,
+    }
+
+
+def relay_performance_from_dict(data: dict[str, Any]) -> RelayPerformance:
+    """Restore a serialized recorded relay from an edit payload."""
+    athletes = tuple(clean_text(name) for name in (data.get("athletes") or [])[:4])
+    if len(athletes) != 4:
+        athletes = ("", "", "", "")
+    splits = tuple(
+        None if value is None else float(value)
+        for value in (list(data.get("splits") or []) + [None, None, None, None])[:4]
+    )
+    return RelayPerformance(
+        clean_text(data.get("event", "")),
+        athletes,  # type: ignore[arg-type]
+        clean_text(data.get("mark", "")),
+        float(data.get("value", 0.0)),
+        clean_text(data.get("source", "")),
+        clean_text(data.get("team_role", "")),
+        splits,  # type: ignore[arg-type]
+        clean_text(data.get("method", "historic")) or "historic",
+    )
+
+
+def rescore_edited_result(payload: dict[str, Any]) -> LineupResult:
+    """Rescore a browser-edited lineup without rerunning the optimizer."""
+    context = payload.get("edit_context") or {}
+    school = [performance_from_dict(item) for item in context.get("school_performances", [])]
+    opponents = [performance_from_dict(item) for item in context.get("opponent_performances", [])]
+    opponent_relay_history = [
+        relay_performance_from_dict(item)
+        for item in context.get("opponent_relay_history", [])
+    ]
+    opponent_relay_splits = [
+        performance_from_dict(item)
+        for item in context.get("opponent_relay_splits", [])
+    ]
+    school_relay_history = [
+        relay_performance_from_dict(item)
+        for item in context.get("school_relay_history", [])
+    ]
+    school_relay_splits = [
+        performance_from_dict(item)
+        for item in context.get("school_relay_splits", [])
+    ]
+    lineup = edited_lineup_from_payload(payload.get("lineup") or {})
+    relays = edited_relays_from_payload(payload.get("relays") or {})
+    result = evaluate_lineup(
+        lineup,
+        relays,
+        school,
+        opponents,
+        opponent_relay_history,
+        opponent_relay_splits,
+    )
+    return attach_edit_context(
+        result,
+        school,
+        opponents,
+        school_relay_history,
+        opponent_relay_history,
+        school_relay_splits,
+        opponent_relay_splits,
+    )
+
+
+def edited_lineup_from_payload(data: dict[str, Any]) -> dict[str, list[str]]:
+    """Extract individual event athlete names from an edited payload."""
+    lineup: dict[str, list[str]] = {}
+    for event, entries in data.items():
+        if event in RELAY_EVENTS:
+            continue
+        athletes: list[str] = []
+        for entry in entries or []:
+            athlete = clean_text(entry.get("athlete", "") if isinstance(entry, dict) else str(entry))
+            if athlete:
+                athletes.append(athlete)
+        lineup[event] = athletes[:MAX_INDIVIDUAL_ENTRIES]
+    return lineup
+
+
+def edited_relays_from_payload(data: dict[str, Any]) -> dict[str, RelaySelection]:
+    """Extract fixed projected relay selections from an edited payload."""
+    relays: dict[str, RelaySelection] = {}
+    for event, relay in data.items():
+        if event not in RELAY_EVENTS or not isinstance(relay, dict):
+            continue
+        athletes = tuple(clean_text(name) for name in (relay.get("athletes") or [])[:4])
+        if len(athletes) != 4 or not all(athletes):
+            continue
+        seconds = relay.get("projected_seconds")
+        if seconds is None:
+            parsed = parse_mark(clean_text(relay.get("projected_mark", "")), event)
+            seconds = parsed[0] if parsed else math.inf
+        relays[event] = RelaySelection(
+            event,
+            athletes,  # type: ignore[arg-type]
+            float(seconds),
+            "coach edited",
+            clean_text(relay.get("source_mark", "coach edited")) or "coach edited",
+        )
+    return relays
 
 
 def apply_fatigue(value: float, is_time: bool, prior_events: int) -> float:
@@ -2334,6 +2744,38 @@ def score_event_details(
                 "points": earned,
             }
     return float(total), details
+
+
+def projected_event_standings(
+    event: str, school_entries: list[Performance], opponents: list[Performance]
+) -> list[dict[str, Any]]:
+    """Return the top eight projected places for display without changing scoring."""
+    ranked = sort_event_pool(school_entries + select_opponent_entries(opponents, event), event)
+    standings: list[dict[str, Any]] = []
+    for place, perf in enumerate(ranked[: len(INDIVIDUAL_POINTS)], start=1):
+        standings.append(
+            {
+                "place": place,
+                "place_label": ordinal(place),
+                "athlete": perf.athlete,
+                "school": perf.source or ("Your Team" if perf.team_role == "school" else "Opponent"),
+                "team_role": perf.team_role,
+                "projected_mark": format_projected_mark(event, perf),
+                "projected_points": float(INDIVIDUAL_POINTS[place - 1]),
+            }
+        )
+    return standings
+
+
+def format_projected_mark(event: str, perf: Performance) -> str:
+    """Format the value used in event projections for the UI standings popover."""
+    if not math.isfinite(perf.value):
+        return format_display_mark(perf.mark)
+    if perf.is_time:
+        return format_time(perf.value)
+    if event in FIELD_EVENTS:
+        return format_inches(perf.value)
+    return format_display_mark(perf.mark)
 
 
 def entry_to_dict(perf: Performance, projection: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2480,7 +2922,15 @@ def run_optimizer(
             + ", ".join(title_event(event) for event in missing_events)
         )
     result.errors = errors
-    return result
+    return attach_edit_context(
+        result,
+        school,
+        opponents,
+        school_relay_history,
+        opponent_relay_history,
+        school_relay_splits,
+        opponent_relay_splits,
+    )
 
 
 def run_optimizer_both(
@@ -2504,7 +2954,7 @@ def demo_result() -> LineupResult:
     raw_lineup = build_lineup(school, opponents, school_relays, opponent_relays)
     result = evaluate_lineup(raw_lineup["lineup"], raw_lineup["relays"], school, opponents, opponent_relays)
     result.scraped = {"school_records": len(school), "opponent_records": len(opponents)}
-    return result
+    return attach_edit_context(result, school, opponents, school_relays, opponent_relays)
 
 
 def sample_data() -> tuple[list[Performance], list[Performance], list[RelayPerformance], list[RelayPerformance]]:
@@ -2643,6 +3093,7 @@ HTML_PAGE = r"""
     }
     button.secondary { background: #e8edf2; color: var(--ink); }
     button:disabled { opacity: .65; cursor: wait; }
+    .file-input-hidden { display: none; }
     .athlete-chip {
       display: inline-flex;
       align-items: center;
@@ -2738,16 +3189,117 @@ HTML_PAGE = r"""
       padding: 13px;
       min-height: 128px;
     }
-    .event-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+    .event-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .event-title {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
     .event-head h3 { margin: 0 0 8px; font-size: 1rem; }
+    .event-title h3 { margin-bottom: 0; }
     .points { color: var(--ok); font-weight: 800; white-space: nowrap; }
+    .event-info {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      width: 21px;
+      height: 21px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #eef3f7;
+      color: #115f95;
+      font-size: .78rem;
+      font-weight: 900;
+      line-height: 1;
+    }
+    .event-info:hover,
+    .event-info:focus {
+      background: #e0f0ff;
+      color: #0b527d;
+      outline: none;
+    }
+    .event-info-popover {
+      position: absolute;
+      left: 0;
+      top: calc(100% + 8px);
+      z-index: 18;
+      display: none;
+      width: min(390px, calc(100vw - 52px));
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: 0 16px 36px rgba(23, 32, 42, .22);
+      text-align: left;
+      cursor: default;
+    }
+    .event-info.open .event-info-popover {
+      display: block;
+    }
+    .standings-title {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--ink);
+      font-size: .84rem;
+      font-weight: 900;
+    }
+    .standings-list {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .standing-row {
+      display: grid;
+      grid-template-columns: 40px minmax(112px, 1fr) auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 7px;
+      border-radius: 6px;
+      background: #f7f9fb;
+      color: var(--ink);
+      font-size: .76rem;
+      line-height: 1.25;
+    }
+    .standing-row.school {
+      background: var(--highlight);
+      box-shadow: inset 0 0 0 1px var(--highlight-line);
+    }
+    .standing-place,
+    .standing-points {
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .standing-name {
+      min-width: 0;
+    }
+    .standing-name strong,
+    .standing-name span {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+    .standing-name span {
+      margin-top: 1px;
+      color: var(--muted);
+      font-size: .68rem;
+      font-weight: 700;
+    }
+    .standing-mark {
+      color: var(--accent);
+      font-weight: 900;
+      white-space: nowrap;
+    }
     ol { margin: 0; padding-left: 20px; }
     li { margin: 5px 0; }
     .relay { border-left: 4px solid var(--accent-2); }
     .athlete-panel {
       position: fixed;
       top: 112px;
-      right: 18px;
+      left: 18px;
       z-index: 20;
       width: min(360px, calc(100vw - 32px));
       max-height: calc(100vh - 136px);
@@ -2842,6 +3394,193 @@ HTML_PAGE = r"""
       background: #e7f6ee;
       color: var(--ok);
     }
+    .athlete-event-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+    .mini-button {
+      padding: 7px 11px;
+      border-radius: 5px;
+      background: #eef3f7;
+      color: var(--ink);
+      font-size: .78rem;
+    }
+    .mini-button:hover { background: #fff7e3; color: var(--accent); }
+    .mini-button.move-action,
+    .mini-button.add-action {
+      background: #e0f0ff;
+      color: #115f95;
+    }
+    .mini-button.move-action:hover,
+    .mini-button.add-action:hover {
+      background: #cbe7ff;
+      color: #0b527d;
+    }
+    .mini-button.remove-action {
+      background: #ffe3df;
+      color: #9b2115;
+    }
+    .mini-button.remove-action:hover {
+      background: #ffd0c9;
+      color: #7a1208;
+    }
+    .athlete-panel-actions {
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+    .coach-edit-block {
+      display: grid;
+      gap: 16px;
+    }
+    .coach-edit-title {
+      margin: 0;
+      font-weight: 800;
+    }
+    .coach-edit-question {
+      margin: 0 0 7px;
+      font-weight: 800;
+    }
+    .event-choice-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .event-choice {
+      min-height: 42px;
+      padding: 8px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      text-align: left;
+      font-size: .82rem;
+      line-height: 1.2;
+    }
+    .event-choice.current {
+      background: var(--highlight);
+      border-color: var(--highlight-line);
+    }
+    .event-choice:disabled {
+      opacity: .72;
+      cursor: not-allowed;
+    }
+    .event-choice.warning {
+      background: #fff4cf;
+      border-color: rgba(240, 172, 27, .85);
+    }
+    .event-choice.selected {
+      box-shadow: 0 0 0 3px rgba(122, 18, 8, .16);
+      border-color: var(--accent);
+    }
+    .edit-warning {
+      border: 1px solid rgba(240, 172, 27, .75);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fff8df;
+      color: #6b4a00;
+      font-size: .86rem;
+    }
+    .edit-alert {
+      border: 2px solid rgba(240, 172, 27, .95);
+      border-radius: 7px;
+      padding: 10px 11px;
+      background: #fff4cf;
+      color: #6b3b00;
+      font-size: .9rem;
+      font-weight: 750;
+      box-shadow: 0 4px 14px rgba(23, 32, 42, .12);
+    }
+    .edit-alert.ok {
+      border-color: rgba(36, 122, 79, .6);
+      background: #e8f7ef;
+      color: var(--ok);
+    }
+    .choice-list {
+      display: grid;
+      gap: 10px;
+    }
+    .choice-card {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      text-align: left;
+      font-size: .86rem;
+    }
+    .choice-card.selected {
+      border-color: var(--accent);
+      background: #fff7e3;
+      box-shadow: 0 0 0 3px rgba(240, 172, 27, .22);
+    }
+    .choice-card > strong,
+    .choice-card > span {
+      display: block;
+    }
+    .choice-card > span {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: .78rem;
+    }
+    .choice-name-line {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .event-asterisk {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 17px;
+      height: 17px;
+      border-radius: 999px;
+      background: #eef3f7;
+      color: var(--accent);
+      font-size: .78rem;
+      font-weight: 900;
+    }
+    .event-asterisk-tip {
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      z-index: 30;
+      display: none;
+      width: max-content;
+      max-width: 230px;
+      padding: 8px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: 0 10px 24px rgba(23, 32, 42, .18);
+      transform: translateX(-50%);
+      font-size: .76rem;
+      line-height: 1.35;
+      white-space: normal;
+    }
+    .event-asterisk:hover .event-asterisk-tip,
+    .event-asterisk:focus .event-asterisk-tip {
+      display: block;
+    }
+    .choice-warning-text {
+      display: block;
+      margin-top: 5px;
+      color: #8a130a;
+      font-weight: 850;
+      font-size: .78rem;
+    }
+    .edit-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     .error {
       border: 1px solid #f0b7ad;
       color: #84291d;
@@ -2850,13 +3589,22 @@ HTML_PAGE = r"""
       padding: 10px 12px;
       margin: 0 0 14px;
     }
+    .notice {
+      border: 1px solid rgba(101, 189, 242, .7);
+      color: #0b527d;
+      background: #eaf6ff;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 0 0 14px;
+      font-weight: 700;
+    }
     @media (max-width: 880px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       .summary { grid-template-columns: 1fr; }
       .athlete-panel {
         top: auto;
-        right: 12px;
+        left: 12px;
         bottom: 12px;
         max-height: min(68vh, 520px);
       }
@@ -2866,13 +3614,13 @@ HTML_PAGE = r"""
 <body>
   <header>
     <h1>Track Lineup Optimizer</h1>
-    <div class="version">Build 2026.06.25-v15</div>
+    <div class="version">Build 2026.07.07-v22</div>
   </header>
   <main>
     <aside>
       <form id="optimizer-form">
         <label for="school-url">School Athletic.net event records URL</label>
-        <input id="school-url" name="schoolUrl" value="https://www.athletic.net/team/16546/track-and-field-outdoor/2025/event-records">
+        <input id="school-url" name="schoolUrl" placeholder="Paste Athletic.net event records URL">
         <label for="gender">Division</label>
         <select id="gender" name="gender">
           <option value="mens" selected>Mens</option>
@@ -2886,6 +3634,9 @@ HTML_PAGE = r"""
         <div class="actions">
           <button id="run-button" type="submit">Generate Lineup</button>
           <button class="secondary" id="demo-button" type="button">Use Demo Data</button>
+          <button class="secondary" id="save-button" type="button">Save Lineup</button>
+          <button class="secondary" id="load-button" type="button">Load Saved Lineup</button>
+          <input class="file-input-hidden" id="load-file" type="file" accept="application/json,.json">
         </div>
       </form>
     </aside>
@@ -2896,8 +3647,8 @@ HTML_PAGE = r"""
           <button class="division-tab" data-division="womens" type="button">Womens</button>
         </div>
         <div id="event-sort" class="event-sort" aria-label="Event order">
-          <button class="sort-option active" data-sort="schedule" type="button">Schedule</button>
-          <button class="sort-option" data-sort="distance" type="button">Distance</button>
+          <button class="sort-option active" data-sort="distance" type="button">Distance</button>
+          <button class="sort-option" data-sort="schedule" type="button">Schedule</button>
         </div>
       </div>
       <div id="errors"></div>
@@ -2925,6 +3676,13 @@ HTML_PAGE = r"""
     const form = document.querySelector("#optimizer-form");
     const runButton = document.querySelector("#run-button");
     const demoButton = document.querySelector("#demo-button");
+    const saveButton = document.querySelector("#save-button");
+    const loadButton = document.querySelector("#load-button");
+    const loadFileInput = document.querySelector("#load-file");
+    const schoolUrlInput = document.querySelector("#school-url");
+    const genderInput = document.querySelector("#gender");
+    const opponentsInput = document.querySelector("#opponents");
+    const injuredAthletesInput = document.querySelector("#injured-athletes");
     const results = document.querySelector("#results");
     const errors = document.querySelector("#errors");
     const divisionTabs = document.querySelector("#division-tabs");
@@ -2935,6 +3693,8 @@ HTML_PAGE = r"""
     const athletePanelCount = document.querySelector("#athlete-panel-count");
     const athletePanelEvents = document.querySelector("#athlete-panel-events");
     const athletePanelClose = document.querySelector("#athlete-panel-close");
+    const APP_BUILD_VERSION = "2026.07.07-team-title-source-v22";
+    const PROJECT_SCHEMA_VERSION = 1;
     const EVENT_SORT_ORDERS = {
       schedule: [
         "4x800 relay", "4x100 relay", "3200m", "110h", "100m", "800m",
@@ -2947,34 +3707,92 @@ HTML_PAGE = r"""
         "shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"
       ]
     };
+    const ALL_EVENTS = EVENT_SORT_ORDERS.schedule;
+    const RELAY_EVENTS = new Set(["4x100 relay", "4x200 relay", "4x400 relay", "4x800 relay"]);
+    const FIELD_EVENTS = new Set(["high jump", "pole vault", "discus", "shot put", "long jump", "triple jump"]);
+    const DISTANCE_EVENTS = new Set(["4x800 relay", "800m", "1600m", "3200m"]);
+    const RUNNING_ORDER = {
+      "4x800 relay": 1,
+      "4x100 relay": 2,
+      "3200m": 3,
+      "110h": 4,
+      "100m": 5,
+      "800m": 6,
+      "4x200 relay": 7,
+      "400m": 8,
+      "300h": 9,
+      "1600m": 10,
+      "200m": 11,
+      "4x400 relay": 12
+    };
     let divisionResults = null;
     let activeDivision = "mens";
     let currentResult = null;
-    let activeEventSort = "schedule";
+    let activeEventSort = "distance";
     let athleteIndex = new Map();
     let selectedAthleteKey = "";
+    let selectedEventInfo = "";
     let panelDrag = null;
+    let editState = null;
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       await optimize("/api/optimize", {
-        schoolUrl: document.querySelector("#school-url").value.trim(),
-        opponentUrls: document.querySelector("#opponents").value.split(/\n+/).map(x => x.trim()).filter(Boolean),
-        injuredAthletes: document.querySelector("#injured-athletes").value.split(/\n+/).map(x => x.trim()).filter(Boolean),
-        gender: document.querySelector("#gender").value
+        schoolUrl: schoolUrlInput.value.trim(),
+        opponentUrls: opponentsInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
+        injuredAthletes: injuredAthletesInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
+        gender: genderInput.value
       });
     });
 
     demoButton.addEventListener("click", async () => optimize("/api/demo", {}));
+    saveButton.addEventListener("click", saveLineupProject);
+    loadButton.addEventListener("click", () => loadFileInput.click());
+    loadFileInput.addEventListener("change", loadLineupProject);
     results.addEventListener("click", (event) => {
+      const infoButton = event.target.closest(".event-info");
+      if (infoButton) {
+        event.stopPropagation();
+        if (event.target.closest(".event-info-popover")) return;
+        toggleEventInfo(infoButton.dataset.eventInfo || "");
+        return;
+      }
       const button = event.target.closest(".athlete-chip");
       if (!button) return;
+      closeEventInfo();
       openAthletePanel(button.dataset.athleteName || button.textContent.trim());
+    });
+    athletePanelEvents.addEventListener("click", (event) => {
+      const actionButton = event.target.closest("[data-edit-action]");
+      if (actionButton) {
+        startCoachEdit(actionButton.dataset.editAction, actionButton.dataset.athlete, actionButton.dataset.event);
+        return;
+      }
+      const eventButton = event.target.closest("[data-target-event]");
+      if (eventButton && editState) {
+        editState.targetEvent = eventButton.dataset.targetEvent;
+        renderCoachEditPanel();
+        return;
+      }
+      const choiceButton = event.target.closest("[data-choice-role]");
+      if (choiceButton && editState) {
+        editState[choiceButton.dataset.choiceRole] = choiceButton.dataset.athlete;
+        renderCoachEditPanel();
+        return;
+      }
+      const commandButton = event.target.closest("[data-edit-command]");
+      if (commandButton) handleEditCommand(commandButton.dataset.editCommand);
     });
     athletePanelClose.addEventListener("click", closeAthletePanel);
     athletePanelHead.addEventListener("pointerdown", startPanelDrag);
     document.addEventListener("pointermove", dragAthletePanel);
     document.addEventListener("pointerup", stopPanelDrag);
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest(".event-info")) closeEventInfo();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeEventInfo();
+    });
     window.addEventListener("resize", () => {
       if (!athletePanel.hidden && !panelDrag) placePanelOnSide();
     });
@@ -3011,6 +3829,112 @@ HTML_PAGE = r"""
       } finally {
         runButton.disabled = false;
       }
+    }
+
+    function saveLineupProject() {
+      if (!currentResult && !divisionResults) {
+        errors.innerHTML = `<div class="error">Generate or load a lineup before saving.</div>`;
+        return;
+      }
+      const project = {
+        type: "track-lineup-project",
+        schemaVersion: PROJECT_SCHEMA_VERSION,
+        appVersion: APP_BUILD_VERSION,
+        savedAt: new Date().toISOString(),
+        form: currentFormState(),
+        activeEventSort,
+        activeDivision,
+        result: divisionResults
+          ? {mode: "both", division_results: cloneResult(divisionResults)}
+          : cloneResult(currentResult)
+      };
+      downloadJson(project, projectFileName(project));
+      errors.innerHTML = `<div class="notice">Lineup project saved. It includes the current lineup, relays, points, and parsed school/opponent data.</div>`;
+    }
+
+    async function loadLineupProject(event) {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      try {
+        const project = JSON.parse(await file.text());
+        restoreLineupProject(project);
+      } catch (error) {
+        errors.innerHTML = `<div class="error">Could not load saved lineup: ${escapeHtml(error.message)}</div>`;
+      } finally {
+        event.target.value = "";
+      }
+    }
+
+    function restoreLineupProject(project) {
+      if (!project || project.type !== "track-lineup-project") {
+        throw new Error("This does not look like a Track Lineup Optimizer project file.");
+      }
+      if (Number(project.schemaVersion || 0) > PROJECT_SCHEMA_VERSION) {
+        throw new Error("This project file was saved by a newer app version.");
+      }
+      if (!project.result || typeof project.result !== "object") {
+        throw new Error("The saved project does not include lineup results.");
+      }
+      restoreFormState(project.form || {});
+      activeEventSort = project.activeEventSort in EVENT_SORT_ORDERS ? project.activeEventSort : "distance";
+      updateEventSortControls();
+      closeAthletePanel();
+      if (project.result.mode === "both" && project.result.division_results) {
+        divisionResults = project.result.division_results;
+        activeDivision = project.activeDivision in divisionResults ? project.activeDivision : "mens";
+        divisionTabs.hidden = false;
+        updateDivisionTabs();
+        renderSingle(divisionResults[activeDivision] || {});
+      } else {
+        divisionResults = null;
+        divisionTabs.hidden = true;
+        renderSingle(project.result);
+      }
+      errors.innerHTML = `<div class="notice">Loaded saved lineup from ${escapeHtml(project.savedAt ? new Date(project.savedAt).toLocaleString() : fileDateFallback())}.</div>`;
+    }
+
+    function currentFormState() {
+      return {
+        schoolUrl: schoolUrlInput.value.trim(),
+        opponentUrls: opponentsInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
+        injuredAthletes: injuredAthletesInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
+        gender: genderInput.value
+      };
+    }
+
+    function restoreFormState(state) {
+      schoolUrlInput.value = state.schoolUrl || "";
+      opponentsInput.value = Array.isArray(state.opponentUrls) ? state.opponentUrls.join("\n") : "";
+      injuredAthletesInput.value = Array.isArray(state.injuredAthletes) ? state.injuredAthletes.join("\n") : "";
+      if (["mens", "womens", "both"].includes(state.gender)) genderInput.value = state.gender;
+    }
+
+    function downloadJson(data, filename) {
+      const blob = new Blob([JSON.stringify(data, null, 2)], {type: "application/json"});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function projectFileName(project) {
+      const formState = project.form || {};
+      const teamId = String(formState.schoolUrl || "").match(/team\/(\d+)/)?.[1] || "lineup";
+      const division = formState.gender === "both" ? "both" : (formState.gender || activeDivision || "lineup");
+      const date = new Date().toISOString().slice(0, 10);
+      return `track-lineup-${safeFilePart(teamId)}-${safeFilePart(division)}-${date}.json`;
+    }
+
+    function safeFilePart(value) {
+      return String(value || "lineup").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "lineup";
+    }
+
+    function fileDateFallback() {
+      return "saved file";
     }
 
     function render(data) {
@@ -3071,6 +3995,7 @@ HTML_PAGE = r"""
 
     function renderSingle(data) {
       closeAthletePanel();
+      closeEventInfo();
       currentResult = data || {};
       athleteIndex = buildAthleteIndex(currentResult);
       document.querySelector("#total-points").textContent = Number(currentResult.total_points || 0).toFixed(1);
@@ -3091,9 +4016,55 @@ HTML_PAGE = r"""
     function renderIndividualEventCard(event, entries, eventPoints) {
       return `
         <article class="event-card">
-          <div class="event-head"><h3>${escapeHtml(titleCase(event))}</h3><span class="points">${Number(eventPoints[event] || 0).toFixed(1)} pts</span></div>
+          <div class="event-head"><div class="event-title"><h3>${escapeHtml(titleCase(event))}</h3>${eventInfoIcon(event)}</div><span class="points">${Number(eventPoints[event] || 0).toFixed(1)} pts</span></div>
           <ol>${entries.map(entry => `<li>${athleteButton(entry.athlete)} ${escapeHtml(entry.adjusted_mark)} <span class="muted">(${formatPlace(entry.projected_place_label)} - ${formatPoints(entry.projected_points)} points)${entry.mark !== entry.adjusted_mark ? ` - PR ${escapeHtml(entry.mark)}` : ""}</span></li>`).join("")}</ol>
         </article>
+      `;
+    }
+
+    function eventInfoIcon(event) {
+      const rows = (currentResult.event_standings?.[event] || []).slice(0, 8);
+      if (!rows.length) return "";
+      const isOpen = selectedEventInfo === event;
+      return `
+        <button class="event-info ${isOpen ? "open" : ""}" type="button" data-event-info="${escapeHtml(event)}" aria-expanded="${isOpen ? "true" : "false"}" aria-label="Projected top eight places for ${escapeHtml(titleCase(event))}">i
+          <span class="event-info-popover" role="tooltip">
+            <span class="standings-title">${escapeHtml(titleCase(event))} projected places</span>
+            <span class="standings-list">
+              ${rows.map(renderStandingRow).join("")}
+            </span>
+          </span>
+        </button>
+      `;
+    }
+
+    function toggleEventInfo(event) {
+      selectedEventInfo = selectedEventInfo === event ? "" : event;
+      updateEventInfoPopovers();
+    }
+
+    function closeEventInfo() {
+      if (!selectedEventInfo) return;
+      selectedEventInfo = "";
+      updateEventInfoPopovers();
+    }
+
+    function updateEventInfoPopovers() {
+      results.querySelectorAll(".event-info").forEach(button => {
+        const isOpen = Boolean(selectedEventInfo) && button.dataset.eventInfo === selectedEventInfo;
+        button.classList.toggle("open", isOpen);
+        button.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      });
+    }
+
+    function renderStandingRow(row) {
+      return `
+        <span class="standing-row ${row.team_role === "school" ? "school" : ""}">
+          <span class="standing-place">${escapeHtml(row.place_label || ordinalLabel(row.place))}</span>
+          <span class="standing-name"><strong>${escapeHtml(row.athlete || "Unknown athlete")}</strong><span>${escapeHtml(row.school || "Unknown school")}</span></span>
+          <span class="standing-mark">${escapeHtml(row.projected_mark || "n/a")}</span>
+          <span class="standing-points">${formatPoints(row.projected_points)} pts</span>
+        </span>
       `;
     }
 
@@ -3170,7 +4141,12 @@ HTML_PAGE = r"""
       athletePanelName.textContent = athlete.name;
       athletePanelCount.textContent = `${athlete.events.length} ${athlete.events.length === 1 ? "event" : "events"}`;
       const athleteEvents = [...athlete.events].sort((a, b) => eventSortRank(a.event) - eventSortRank(b.event) || titleCase(a.event).localeCompare(titleCase(b.event)));
-      athletePanelEvents.innerHTML = athleteEvents.map(detail => `
+      const addAction = athlete.events.length < 4 ? `
+        <li class="athlete-panel-actions">
+          <button class="mini-button add-action" type="button" data-edit-action="add" data-athlete="${escapeHtml(athlete.name)}" data-event="">Add Event</button>
+        </li>
+      ` : "";
+      athletePanelEvents.innerHTML = addAction + athleteEvents.map(detail => `
         <li class="athlete-event-item">
           <div class="athlete-event-top">
             <span>${escapeHtml(titleCase(detail.event))}</span>
@@ -3181,6 +4157,10 @@ HTML_PAGE = r"""
             <span class="athlete-pill">${formatPlace(detail.place)}</span>
             <span class="athlete-pill points-pill">${formatPoints(detail.points)} pts</span>
           </div>
+          <div class="athlete-event-actions">
+            <button class="mini-button move-action" type="button" data-edit-action="move" data-athlete="${escapeHtml(athlete.name)}" data-event="${escapeHtml(detail.event)}">Move</button>
+            <button class="mini-button remove-action" type="button" data-edit-action="remove" data-athlete="${escapeHtml(athlete.name)}" data-event="${escapeHtml(detail.event)}">Remove</button>
+          </div>
         </li>
       `).join("");
       athletePanel.hidden = false;
@@ -3189,6 +4169,7 @@ HTML_PAGE = r"""
     }
 
     function closeAthletePanel() {
+      editState = null;
       selectedAthleteKey = "";
       highlightAthlete();
       athletePanel.hidden = true;
@@ -3204,9 +4185,8 @@ HTML_PAGE = r"""
 
     function placePanelOnSide() {
       if (athletePanel.hidden) return;
-      const width = athletePanel.offsetWidth || 360;
       const height = athletePanel.offsetHeight || 420;
-      athletePanel.style.left = `${Math.max(12, window.innerWidth - width - 18)}px`;
+      athletePanel.style.left = `${window.innerWidth <= 880 ? 12 : 18}px`;
       athletePanel.style.top = `${window.innerWidth <= 880 ? Math.max(12, window.innerHeight - height - 12) : 112}px`;
       athletePanel.style.right = "auto";
       athletePanel.style.bottom = "auto";
@@ -3240,6 +4220,418 @@ HTML_PAGE = r"""
       panelDrag = null;
     }
 
+    function startCoachEdit(mode, athlete, sourceEvent) {
+      if (!currentResult?.edit_context) {
+        errors.innerHTML = `<div class="error">Generate a lineup before editing assignments.</div>`;
+        return;
+      }
+      if (mode === "add" && athleteEventList(athlete).length >= 4) {
+        errors.innerHTML = `<div class="error">${escapeHtml(athlete)} is already in four events.</div>`;
+        return;
+      }
+      editState = {
+        mode,
+        athlete,
+        sourceEvent: sourceEvent || "",
+        targetEvent: "",
+        sourceReplacement: "",
+        targetRemoval: ""
+      };
+      selectedAthleteKey = athleteKey(athlete);
+      highlightAthlete();
+      renderCoachEditPanel();
+      athletePanel.hidden = false;
+      document.body.classList.add("athlete-panel-open");
+      placePanelOnSide();
+    }
+
+    function renderCoachEditPanel() {
+      if (!editState) return;
+      athletePanelName.textContent = editPanelTitle();
+      athletePanelCount.textContent = editState.sourceEvent ? titleCase(editState.sourceEvent) : "New event";
+      const needsSourceReplacement = editState.mode !== "add";
+      const needsTargetEvent = editState.mode !== "remove";
+      const sourceSuggestions = needsSourceReplacement ? replacementSuggestions(editState.sourceEvent, editState.athlete) : [];
+      if (needsSourceReplacement && editState.sourceReplacement && !sourceSuggestions.some(item => item.athlete === editState.sourceReplacement)) {
+        editState.sourceReplacement = "";
+      }
+      const targetStatus = needsTargetEvent && editState.targetEvent
+        ? targetEventStatus(editState.athlete, editState.sourceEvent, editState.targetEvent)
+        : {reasons: []};
+      const targetChoices = needsTargetEvent && editState.targetEvent
+        ? eventAthletes(editState.targetEvent).filter(name => athleteKey(name) !== athleteKey(editState.athlete))
+        : [];
+      if (editState.targetRemoval && !targetChoices.includes(editState.targetRemoval)) {
+        editState.targetRemoval = "";
+      }
+      const canApply = Boolean(
+        editState.mode === "remove"
+          ? editState.sourceReplacement
+          : (
+            editState.targetEvent
+            && !targetStatus.reasons.length
+            && (!targetChoices.length || editState.targetRemoval)
+            && (editState.mode === "add" || editState.sourceReplacement)
+          )
+      );
+      athletePanelEvents.innerHTML = `
+        <li class="coach-edit-block">
+          <p class="coach-edit-title">${escapeHtml(editPanelLead())}</p>
+          ${needsTargetEvent ? renderEventScheduleChoices(targetStatus) : ""}
+          ${needsSourceReplacement ? renderReplacementQuestion(
+            "sourceReplacement",
+            `Who will replace ${editState.athlete} in ${titleCase(editState.sourceEvent)}?`,
+            sourceSuggestions,
+            editState.sourceReplacement
+          ) : ""}
+          ${needsTargetEvent && editState.targetEvent ? renderTargetRemovalQuestion(targetChoices) : ""}
+          <div class="edit-actions">
+            <button class="mini-button" type="button" data-edit-command="back">Back</button>
+            <button type="button" data-edit-command="apply" ${canApply ? "" : "disabled"}>Apply Change</button>
+          </div>
+        </li>
+      `;
+    }
+
+    function editPanelTitle() {
+      if (editState.mode === "add") return `Add event for ${editState.athlete}`;
+      if (editState.mode === "move") return `Move ${editState.athlete}`;
+      return `Remove ${editState.athlete}`;
+    }
+
+    function editPanelLead() {
+      if (editState.mode === "add") return `Add an event for ${editState.athlete}`;
+      if (editState.mode === "move") return `Move ${editState.athlete} from ${titleCase(editState.sourceEvent)}`;
+      return `Remove ${editState.athlete} from ${titleCase(editState.sourceEvent)}`;
+    }
+
+    function renderEventScheduleChoices(selectedStatus) {
+      const currentEvents = new Set(athleteEventList(editState.athlete));
+      const selectedAlert = editState.targetEvent
+        ? (
+          selectedStatus.reasons.length
+            ? `<div class="edit-alert">${selectedStatus.reasons.map(escapeHtml).join(" ")}</div>`
+            : `<div class="edit-alert ok">Valid target selected: ${escapeHtml(titleCase(editState.targetEvent))}.</div>`
+        )
+        : `<div class="edit-warning">Current events are light blue and disabled. Yellow events need review; click one to see why.</div>`;
+      return `
+        <div>
+          <p class="coach-edit-question">Which event should ${escapeHtml(editState.athlete)} move into?</p>
+          ${selectedAlert}
+          <div class="event-choice-grid">
+            ${ALL_EVENTS.map(event => {
+              const status = targetEventStatus(editState.athlete, editState.sourceEvent, event);
+              const isCurrent = currentEvents.has(event);
+              const classes = [
+                "event-choice",
+                isCurrent ? "current" : "",
+                !isCurrent && status.reasons.length ? "warning" : "",
+                editState.targetEvent === event ? "selected" : ""
+              ].filter(Boolean).join(" ");
+              return `<button class="${classes}" type="button" data-target-event="${escapeHtml(event)}" ${isCurrent ? "disabled" : ""}>${escapeHtml(titleCase(event))}</button>`;
+            }).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderReplacementQuestion(role, question, choices, selected) {
+      return `
+        <div>
+          <p class="coach-edit-question">${escapeHtml(question)}</p>
+          <div class="choice-list">
+            ${choices.length ? choices.map(choice => renderChoiceCard(role, choice, selected)).join("") : `<div class="edit-warning">No available recorded replacement was found for ${escapeHtml(titleCase(editState.sourceEvent))}.</div>`}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderTargetRemovalQuestion(choices) {
+      if (!choices.length) {
+        return `<div class="edit-warning">No athlete needs to be removed from ${escapeHtml(titleCase(editState.targetEvent))} because there is an open spot.</div>`;
+      }
+      return `
+        <div>
+          <p class="coach-edit-question">${escapeHtml(`Who will ${editState.athlete} replace in ${titleCase(editState.targetEvent)}?`)}</p>
+          <div class="choice-list">
+            ${choices.map(name => renderChoiceCard("targetRemoval", {
+              athlete: name,
+              mark: athleteEventMark(name, editState.targetEvent),
+              warnings: []
+            }, editState.targetRemoval)).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderChoiceCard(role, choice, selected) {
+      const warnings = choice.warnings?.length ? `<span class="choice-warning-text">${escapeHtml(choice.warnings.join(" "))}</span>` : "";
+      const eventSummary = athleteEventList(choice.athlete).map(titleCase).join(", ") || "No current events";
+      return `
+        <button class="choice-card ${selected === choice.athlete ? "selected" : ""}" type="button" data-choice-role="${escapeHtml(role)}" data-athlete="${escapeHtml(choice.athlete)}">
+          <strong class="choice-name-line">
+            ${escapeHtml(choice.athlete)}
+            <span class="event-asterisk" tabindex="0">*
+              <span class="event-asterisk-tip">Current events: ${escapeHtml(eventSummary)}</span>
+            </span>
+          </strong>
+          <span>${escapeHtml(choice.mark || "recorded mark")}</span>
+          ${warnings}
+        </button>
+      `;
+    }
+
+    function handleEditCommand(command) {
+      if (!editState) return;
+      if (command === "back") {
+        openAthletePanel(editState.athlete);
+        return;
+      }
+      if (command === "apply") applyCoachEdit();
+    }
+
+    async function applyCoachEdit() {
+      if (!editState || !currentResult) return;
+      const next = cloneResult(currentResult);
+      try {
+        if (editState.mode === "remove") {
+          replaceEventAthlete(next, editState.sourceEvent, editState.athlete, editState.sourceReplacement);
+        } else if (editState.mode === "add") {
+          addAthleteToEvent(next, editState.targetEvent, editState.athlete, editState.targetRemoval);
+        } else {
+          replaceEventAthlete(next, editState.sourceEvent, editState.athlete, editState.sourceReplacement);
+          addAthleteToEvent(next, editState.targetEvent, editState.athlete, editState.targetRemoval);
+        }
+        await rescoreEditedLineup(next);
+      } catch (error) {
+        errors.innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    async function rescoreEditedLineup(next) {
+      athletePanelCount.textContent = "rescoring...";
+      const response = await fetch("/api/rescore", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          lineup: next.lineup || {},
+          relays: next.relays || {},
+          edit_context: currentResult.edit_context || {}
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error((data.errors || [data.error || "Could not rescore edited lineup."])[0]);
+      if (divisionResults) divisionResults[activeDivision] = data;
+      renderSingle(data);
+    }
+
+    function replaceEventAthlete(result, event, outgoingAthlete, incomingAthlete) {
+      if (!incomingAthlete) throw new Error(`Choose a replacement for ${titleCase(event)}.`);
+      if (RELAY_EVENTS.has(event)) {
+        replaceRelayAthlete(result, event, outgoingAthlete, incomingAthlete);
+        return;
+      }
+      const entries = result.lineup?.[event] || [];
+      const nextEntries = entries.filter(entry => athleteKey(entry.athlete) !== athleteKey(outgoingAthlete));
+      if (!nextEntries.some(entry => athleteKey(entry.athlete) === athleteKey(incomingAthlete))) {
+        nextEntries.push(entryForAthlete(incomingAthlete, event));
+      }
+      result.lineup[event] = nextEntries.slice(0, 3);
+    }
+
+    function addAthleteToEvent(result, event, athlete, removedAthlete) {
+      if (RELAY_EVENTS.has(event)) {
+        if (!removedAthlete) throw new Error(`Choose who ${athlete} will replace in ${titleCase(event)}.`);
+        replaceRelayAthlete(result, event, removedAthlete, athlete);
+        return;
+      }
+      const entries = [...(result.lineup?.[event] || [])];
+      const nextEntries = removedAthlete
+        ? entries.filter(entry => athleteKey(entry.athlete) !== athleteKey(removedAthlete))
+        : entries;
+      if (!nextEntries.some(entry => athleteKey(entry.athlete) === athleteKey(athlete))) {
+        nextEntries.push(entryForAthlete(athlete, event));
+      }
+      result.lineup[event] = nextEntries.slice(0, 3);
+    }
+
+    function replaceRelayAthlete(result, event, outgoingAthlete, incomingAthlete) {
+      const relay = result.relays?.[event];
+      if (!relay) throw new Error(`${titleCase(event)} is not currently in the lineup.`);
+      const index = (relay.athletes || []).findIndex(name => athleteKey(name) === athleteKey(outgoingAthlete));
+      if (index < 0) throw new Error(`${outgoingAthlete} is not in ${titleCase(event)}.`);
+      const oldLeg = relayLegValue(event, outgoingAthlete) ?? relayLegTimeAt(relay, index);
+      const newLeg = relayLegValue(event, incomingAthlete);
+      if (!Number.isFinite(newLeg)) throw new Error(`${incomingAthlete} does not have a relay-compatible mark for ${titleCase(event)}.`);
+      relay.athletes[index] = incomingAthlete;
+      const oldSeconds = Number(relay.projected_seconds || 0);
+      relay.projected_seconds = Math.max(0, oldSeconds + newLeg - oldLeg);
+      relay.projected_mark = formatSeconds(relay.projected_seconds);
+      relay.method = "coach edited";
+      relay.source_mark = "old relay time plus leg-time difference";
+      relay.leg_times = Array.isArray(relay.leg_times) && relay.leg_times.length === 4
+        ? relay.leg_times.map((value, legIndex) => legIndex === index ? newLeg : value)
+        : [];
+    }
+
+    function replacementSuggestions(event, removedAthlete) {
+      const existing = new Set(eventAthletes(event).map(athleteKey));
+      const candidates = eventCandidates(event)
+        .filter(choice => athleteKey(choice.athlete) !== athleteKey(removedAthlete))
+        .filter(choice => !existing.has(athleteKey(choice.athlete)))
+        .filter(choice => athleteEventList(choice.athlete).length <= 3)
+        .filter(choice => !hasAdjacentRunningEvent(choice.athlete, event))
+        .map(choice => ({...choice, warnings: replacementWarnings(choice.athlete, event)}));
+      candidates.sort((a, b) => eventBetterValue(event, a.value, b.value));
+      return candidates.slice(0, 6);
+    }
+
+    function eventCandidates(event) {
+      if (RELAY_EVENTS.has(event)) {
+        const legs = currentResult.edit_context?.relay_leg_values?.[event] || {};
+        return Object.entries(legs).map(([athlete, value]) => ({
+          athlete,
+          value: Number(value),
+          mark: formatSeconds(Number(value))
+        }));
+      }
+      const best = new Map();
+      for (const perf of currentResult.edit_context?.school_performances || []) {
+        if (perf.event !== event) continue;
+        const key = athleteKey(perf.athlete);
+        const current = best.get(key);
+        if (!current || eventBetterValue(event, perf.value, current.value) < 0) {
+          best.set(key, {athlete: perf.athlete, value: Number(perf.value), mark: perf.mark});
+        }
+      }
+      return [...best.values()];
+    }
+
+    function replacementWarnings(athlete, event) {
+      const events = [...athleteEventList(athlete), event];
+      const warnings = [];
+      if (events.includes("400m") && events.includes("4x400 relay")) warnings.push("400/4x400 warning.");
+      if (distanceLimitExceeded(events)) warnings.push("distance load warning.");
+      return warnings;
+    }
+
+    function targetEventStatus(athlete, sourceEvent, targetEvent) {
+      const currentEvents = athleteEventList(athlete);
+      const afterMove = currentEvents.filter(event => event !== sourceEvent);
+      const reasons = [];
+      if (targetEvent === sourceEvent) reasons.push(`${athlete} is already in ${titleCase(sourceEvent)}.`);
+      if (afterMove.includes(targetEvent)) reasons.push(`${athlete} is already entered in ${titleCase(targetEvent)}.`);
+      if (!hasRecordedEventMark(athlete, targetEvent)) reasons.push(`${athlete} does not have a recorded mark for ${titleCase(targetEvent)}.`);
+      const proposedEvents = [...afterMove, targetEvent];
+      if (proposedEvents.length > 4) reasons.push(`${athlete} would be over the four-event limit.`);
+      if (proposedEvents.includes("400m") && proposedEvents.includes("4x400 relay")) reasons.push(`${athlete} would be in both the 400m and 4x400 relay.`);
+      if (distanceLimitExceeded(proposedEvents)) reasons.push(`${athlete} would exceed the distance-event limit.`);
+      if (hasAdjacentRunningPair(proposedEvents)) reasons.push(`${athlete} would have back to back running events.`);
+      return {reasons};
+    }
+
+    function eventAthletes(event) {
+      if (RELAY_EVENTS.has(event)) return [...(currentResult.relays?.[event]?.athletes || [])];
+      return (currentResult.lineup?.[event] || []).map(entry => entry.athlete);
+    }
+
+    function athleteEventList(athlete) {
+      const key = athleteKey(athlete);
+      const events = [];
+      for (const [event, entries] of Object.entries(currentResult?.lineup || {})) {
+        if ((entries || []).some(entry => athleteKey(entry.athlete) === key)) events.push(event);
+      }
+      for (const [event, relay] of Object.entries(currentResult?.relays || {})) {
+        if ((relay.athletes || []).some(name => athleteKey(name) === key)) events.push(event);
+      }
+      return events;
+    }
+
+    function athleteEventMark(athlete, event) {
+      if (RELAY_EVENTS.has(event)) {
+        const value = relayLegValue(event, athlete);
+        return Number.isFinite(value) ? formatSeconds(value) : "relay leg";
+      }
+      const entry = (currentResult.lineup?.[event] || []).find(item => athleteKey(item.athlete) === athleteKey(athlete));
+      if (entry) return entry.adjusted_mark || entry.mark || "recorded mark";
+      const perf = bestPerformance(athlete, event);
+      return perf?.mark || "recorded mark";
+    }
+
+    function hasRecordedEventMark(athlete, event) {
+      if (RELAY_EVENTS.has(event)) return Number.isFinite(relayLegValue(event, athlete));
+      return Boolean(bestPerformance(athlete, event));
+    }
+
+    function bestPerformance(athlete, event) {
+      const key = athleteKey(athlete);
+      let best = null;
+      for (const perf of currentResult.edit_context?.school_performances || []) {
+        if (perf.event !== event || athleteKey(perf.athlete) !== key) continue;
+        if (!best || eventBetterValue(event, perf.value, best.value) < 0) best = perf;
+      }
+      return best;
+    }
+
+    function entryForAthlete(athlete, event) {
+      const perf = bestPerformance(athlete, event);
+      return {
+        athlete,
+        mark: perf?.mark || "n/a",
+        adjusted_mark: perf?.mark || "n/a",
+        projected_place_label: "unplaced",
+        projected_points: 0
+      };
+    }
+
+    function relayLegValue(event, athlete) {
+      const value = currentResult.edit_context?.relay_leg_values?.[event]?.[athlete];
+      return value === undefined ? NaN : Number(value);
+    }
+
+    function relayLegTimeAt(relay, index) {
+      const explicit = Number(relay.leg_times?.[index]);
+      if (Number.isFinite(explicit)) return explicit;
+      const projected = Number(relay.projected_seconds || 0);
+      return projected > 0 ? projected / 4 : 0;
+    }
+
+    function hasAdjacentRunningEvent(athlete, event) {
+      if (!(event in RUNNING_ORDER)) return false;
+      const order = RUNNING_ORDER[event];
+      return athleteEventList(athlete).some(existing => existing in RUNNING_ORDER && Math.abs(RUNNING_ORDER[existing] - order) === 1);
+    }
+
+    function hasAdjacentRunningPair(events) {
+      const ordered = events.filter(event => event in RUNNING_ORDER).map(event => RUNNING_ORDER[event]).sort((a, b) => a - b);
+      return ordered.some((value, index) => index > 0 && value - ordered[index - 1] <= 1);
+    }
+
+    function distanceLimitExceeded(events) {
+      if (!events.some(event => DISTANCE_EVENTS.has(event))) return false;
+      const limit = events.includes("4x800 relay") && events.includes("800m") ? 3 : 2;
+      return events.length > limit;
+    }
+
+    function eventBetterValue(event, a, b) {
+      return FIELD_EVENTS.has(event) ? Number(b) - Number(a) : Number(a) - Number(b);
+    }
+
+    function cloneResult(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function formatSeconds(value) {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds)) return "n/a";
+      if (seconds >= 60) {
+        const minutes = Math.floor(seconds / 60);
+        const rest = (seconds - minutes * 60).toFixed(2).padStart(5, "0");
+        return `${minutes}:${rest}`;
+      }
+      return seconds.toFixed(2);
+    }
+
     function titleCase(value) {
       return value.replace(/\b\w/g, letter => letter.toUpperCase()).replace("Relay", "Relay");
     }
@@ -3256,6 +4648,15 @@ HTML_PAGE = r"""
     function relayPlaceFromPoints(points) {
       const places = {10: "1st", 8: "2nd", 6: "3rd", 4: "4th", 2: "5th"};
       return places[points] || "unplaced";
+    }
+
+    function ordinalLabel(value) {
+      const number = Number(value || 0);
+      if (!number) return "n/a";
+      const mod100 = number % 100;
+      if (mod100 >= 10 && mod100 <= 20) return `${number}th`;
+      const suffix = {1: "st", 2: "nd", 3: "rd"}[number % 10] || "th";
+      return `${number}${suffix}`;
     }
 
     function athleteKey(value) {
@@ -3300,6 +4701,9 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length) or b"{}")
             if self.path == "/api/demo":
                 self.send_json(asdict(demo_result()))
+                return
+            if self.path == "/api/rescore":
+                self.send_json(asdict(rescore_edited_result(payload)))
                 return
             if self.path != "/api/optimize":
                 self.send_json({"error": "Not found"}, status=404)
@@ -3360,11 +4764,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     """Start the local web server."""
-    host = "127.0.0.1"
-    requested_port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    host = os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+    requested_port = int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8000))
     server = None
     port = requested_port
-    for candidate in range(requested_port, requested_port + 20):
+    port_candidates = [requested_port] if os.environ.get("PORT") else range(requested_port, requested_port + 20)
+    for candidate in port_candidates:
         try:
             server = ThreadingHTTPServer((host, candidate), AppHandler)
             port = candidate
@@ -3372,29 +4777,16 @@ def main() -> None:
         except OSError:
             continue
     if server is None:
+        if os.environ.get("PORT"):
+            raise RuntimeError(f"Could not bind to required PORT {requested_port}")
         raise RuntimeError(f"No open port found from {requested_port} to {requested_port + 19}")
-    if sys.stdout:
-        print(f"Track Lineup Optimizer (Made by Jayden Yang) {APP_VERSION} running at http://{host}:{port}")
+    try:
+        if sys.stdout:
+            print(f"Track Lineup Optimizer (Made by Jayden Yang) {APP_VERSION} running at http://{host}:{port}")
+    except OSError:
+        pass
     server.serve_forever()
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

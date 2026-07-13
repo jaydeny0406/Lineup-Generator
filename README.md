@@ -34,6 +34,22 @@ cd C:\Users\jayde\Documents\Codex\2026-06-07\create-a-web-app-that-generates\out
 python -m unittest
 ```
 
+## Deploy Beta
+
+The app is ready to run as a Python web service on hosts such as Render, Railway, or Fly.io.
+
+For Render:
+
+1. Push this folder to a GitHub repository.
+2. Create a new Render Web Service from that repository.
+3. Use `outputs/track-lineup-app` as the root directory if the full Codex workspace is pushed.
+4. Use the included `render.yaml`, or configure manually:
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `python app.py`
+5. Render will set `PORT`; the app automatically binds to `0.0.0.0` in production.
+
+The generated Render URL can stay unadvertised and shared only with beta testers.
+
 ## Notes
 
 - The app uses only Python's standard library for the server.

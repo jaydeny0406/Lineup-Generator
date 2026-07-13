@@ -34,6 +34,17 @@ class ParserTests(unittest.TestCase):
             "https://www.athletic.net/team/99/track-and-field-indoor/2026/event-records",
         )
 
+    def test_parse_athletic_team_url_accepts_season_page_without_event_records(self):
+        team_id, season_id, canonical = app.parse_athletic_team_url(
+            "https://www.athletic.net/team/16797/track-and-field-outdoor/2026"
+        )
+        self.assertEqual(team_id, "16797")
+        self.assertEqual(season_id, 2026)
+        self.assertEqual(
+            canonical,
+            "https://www.athletic.net/team/16797/track-and-field-outdoor/2026/event-records",
+        )
+
     def test_parse_track_times(self):
         self.assertEqual(app.parse_mark("10.92", "100m"), (10.92, True))
         self.assertEqual(app.parse_mark("22.3h", "200m"), (22.3, True))
@@ -159,6 +170,35 @@ class ParserTests(unittest.TestCase):
             ("One Runner", "Two Runner", "Three Runner", "Four Runner"),
         )
 
+    def test_api_team_name_replaces_placeholder_source(self):
+        payload = {
+            "team": {"Name": "Naperville (North) Track & Field and Cross Country"},
+            "eventRecords": [
+                {
+                    "Gender": "M",
+                    "Event": "100 Meters",
+                    "PersonalEvent": True,
+                    "Result": "10.86",
+                    "FirstName": "Andrew",
+                    "LastName": "Hebron",
+                    "IDResult": 1,
+                },
+                {
+                    "Gender": "M",
+                    "Event": "100 Meters - Relay Split",
+                    "PersonalEvent": True,
+                    "Result": "10.5h",
+                    "FirstName": "Andrew",
+                    "LastName": "Hebron",
+                    "IDResult": 2,
+                },
+            ],
+            "relayMembers": [],
+        }
+        result = app.parse_athletic_api_data(payload, "Opponent 1", "opponent", "mens")
+        self.assertEqual(result.performances[0].source, "Naperville (North)")
+        self.assertEqual(result.relay_splits[0].source, "Naperville (North)")
+
     def test_named_relay_split_is_not_an_individual_seed(self):
         payload = {
             "eventRecords": [
@@ -243,6 +283,88 @@ class ParserTests(unittest.TestCase):
             "?teamId=16546&seasonId=2026",
         )
 
+    def test_resolve_team_name_from_athletic_title_before_api_records(self):
+        payload = {
+            "eventRecords": [
+                {
+                    "Gender": "M",
+                    "Event": "100 Meters",
+                    "PersonalEvent": True,
+                    "Result": "10.86",
+                    "FirstName": "Andrew",
+                    "LastName": "Hebron",
+                    "IDResult": 1,
+                }
+            ],
+            "relayMembers": [],
+        }
+        page = "<title>Naperville (North) - High School Track and Field Outdoor 2026</title>"
+        with patch("app.fetch_text_url", side_effect=[page, app.json.dumps(payload)]):
+            result = app.scrape_team_data(
+                "https://www.athletic.net/team/16546/track-and-field-outdoor/2026/event-records",
+                "school",
+                "Your Team",
+                "mens",
+            )
+        self.assertEqual(result.performances[0].source, "Naperville (North)")
+
+    def test_resolve_team_name_handles_opponent_and_plain_season_links(self):
+        payload = {
+            "eventRecords": [
+                {
+                    "Gender": "M",
+                    "Event": "100 Meters",
+                    "PersonalEvent": True,
+                    "Result": "11.00",
+                    "FirstName": "Test",
+                    "LastName": "Runner",
+                    "IDResult": 1,
+                }
+            ],
+            "relayMembers": [],
+        }
+        page = "<title>Yorkville - High School Track and Field Outdoor 2026</title>"
+        with patch("app.fetch_text_url", side_effect=[page, app.json.dumps(payload)]):
+            result = app.scrape_team_data(
+                "https://www.athletic.net/team/16797/track-and-field-outdoor/2026",
+                "opponent",
+                "Opponent 2",
+                "mens",
+            )
+        self.assertEqual(result.performances[0].source, "Yorkville")
+
+    def test_extract_team_name_from_athletic_titles(self):
+        self.assertEqual(
+            app.extract_team_name("<title>Hinsdale (Central) - High School Track and Field Outdoor 2026</title>"),
+            "Hinsdale (Central)",
+        )
+        self.assertEqual(
+            app.extract_team_name("Title: Yorkville - High School Track and Field Outdoor 2026"),
+            "Yorkville",
+        )
+
+    def test_html_fallback_team_title_replaces_placeholder_source(self):
+        page = """
+        <html>
+          <head><title>Actual High School Track & Field and Cross Country | Athletic.net</title></head>
+          <body>
+            <h3>100 Meters</h3>
+            <table>
+              <tr><th>Rank</th><th>Athlete</th><th>Mark</th></tr>
+              <tr><td>1</td><td>Alex Carter</td><td>10.92</td></tr>
+            </table>
+          </body>
+        </html>
+        """
+        with patch("app.fetch_text_url", side_effect=[page, RuntimeError("api blocked"), page]):
+            result = app.scrape_team_data(
+                "https://www.athletic.net/team/16546/track-and-field-outdoor/2026/event-records",
+                "opponent",
+                "Opponent 1",
+                "mens",
+            )
+        self.assertEqual(result.performances[0].source, "Actual High School")
+
 
 class OptimizerTests(unittest.TestCase):
     def test_injured_athlete_is_removed_from_all_team_data(self):
@@ -301,22 +423,86 @@ class OptimizerTests(unittest.TestCase):
         self.assertIn('id="injured-athletes"', app.HTML_PAGE)
         self.assertIn("injuredAthletes:", app.HTML_PAGE)
 
+    def test_school_url_input_has_no_default_link(self):
+        self.assertIn('id="school-url"', app.HTML_PAGE)
+        self.assertIn('placeholder="Paste Athletic.net event records URL"', app.HTML_PAGE)
+        self.assertNotIn('value="https://www.athletic.net/team/16546/track-and-field-outdoor/2025/event-records"', app.HTML_PAGE)
+
     def test_ui_includes_clickable_athlete_panel(self):
         self.assertIn('id="athlete-panel"', app.HTML_PAGE)
         self.assertIn("athlete-chip", app.HTML_PAGE)
         self.assertIn("openAthletePanel", app.HTML_PAGE)
         self.assertIn("buildAthleteIndex", app.HTML_PAGE)
+        self.assertIn("left: 18px", app.HTML_PAGE)
         self.assertNotIn("body.athlete-panel-open section", app.HTML_PAGE)
 
     def test_ui_includes_event_sort_options(self):
         self.assertIn('id="event-sort"', app.HTML_PAGE)
         self.assertIn('data-sort="schedule"', app.HTML_PAGE)
         self.assertIn('data-sort="distance"', app.HTML_PAGE)
+        self.assertIn('let activeEventSort = "distance"', app.HTML_PAGE)
+        self.assertIn('<button class="sort-option active" data-sort="distance"', app.HTML_PAGE)
         self.assertIn("sortedEventNames", app.HTML_PAGE)
         self.assertIn('"4x800 relay", "4x100 relay", "3200m", "110h"', app.HTML_PAGE)
         self.assertIn('"shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"', app.HTML_PAGE)
         self.assertIn('"100m", "200m", "400m", "800m", "1600m", "3200m", "110h", "300h"', app.HTML_PAGE)
         self.assertIn('"4x100 relay", "4x200 relay", "4x400 relay", "4x800 relay"', app.HTML_PAGE)
+
+    def test_ui_includes_save_load_project_controls(self):
+        self.assertIn('id="save-button"', app.HTML_PAGE)
+        self.assertIn('id="load-button"', app.HTML_PAGE)
+        self.assertIn('id="load-file"', app.HTML_PAGE)
+        self.assertIn("saveLineupProject", app.HTML_PAGE)
+        self.assertIn("loadLineupProject", app.HTML_PAGE)
+        self.assertIn("track-lineup-project", app.HTML_PAGE)
+        self.assertIn("current lineup, relays, points, and parsed school/opponent data", app.HTML_PAGE)
+
+    def test_ui_includes_individual_event_info_popover(self):
+        self.assertIn("eventInfoIcon", app.HTML_PAGE)
+        self.assertIn("event_standings", app.HTML_PAGE)
+        self.assertIn("event-info-popover", app.HTML_PAGE)
+        self.assertIn("standings-list", app.HTML_PAGE)
+        self.assertIn("renderStandingRow", app.HTML_PAGE)
+        self.assertIn("toggleEventInfo", app.HTML_PAGE)
+        self.assertIn('data-event-info="${escapeHtml(event)}"', app.HTML_PAGE)
+        self.assertIn(".event-info.open .event-info-popover", app.HTML_PAGE)
+        self.assertNotIn(".event-info:hover .event-info-popover", app.HTML_PAGE)
+        self.assertNotIn(".event-info:focus .event-info-popover", app.HTML_PAGE)
+
+    def test_ui_includes_coach_edit_actions(self):
+        self.assertIn('data-edit-action="move"', app.HTML_PAGE)
+        self.assertIn('data-edit-action="remove"', app.HTML_PAGE)
+        self.assertIn('data-edit-action="add"', app.HTML_PAGE)
+        self.assertIn("move-action", app.HTML_PAGE)
+        self.assertIn("remove-action", app.HTML_PAGE)
+        self.assertIn("add-action", app.HTML_PAGE)
+        self.assertIn("Who will replace", app.HTML_PAGE)
+        self.assertIn("Who will ${editState.athlete} replace", app.HTML_PAGE)
+        self.assertIn("replacementSuggestions", app.HTML_PAGE)
+        self.assertIn("event-asterisk", app.HTML_PAGE)
+        self.assertIn("choice-warning-text", app.HTML_PAGE)
+        self.assertIn("would have back to back running events", app.HTML_PAGE)
+        self.assertIn('${isCurrent ? "disabled" : ""}', app.HTML_PAGE)
+        self.assertIn("/api/rescore", app.HTML_PAGE)
+
+    def test_demo_result_includes_edit_context(self):
+        result = app.demo_result()
+        self.assertIn("school_performances", result.edit_context)
+        self.assertIn("opponent_performances", result.edit_context)
+        self.assertIn("relay_leg_values", result.edit_context)
+        self.assertGreater(len(result.edit_context["school_performances"]), 0)
+
+    def test_rescore_edited_result_updates_points(self):
+        result = app.demo_result()
+        edited = app.asdict(result)
+        edited["lineup"]["100m"] = [
+            entry for entry in edited["lineup"].get("100m", [])
+            if entry["athlete"] != "Alex Carter"
+        ]
+        rescored = app.rescore_edited_result(edited)
+        self.assertIn("100m", rescored.event_points)
+        self.assertLessEqual(rescored.event_points["100m"], result.event_points.get("100m", 0))
+        self.assertIn("school_performances", rescored.edit_context)
 
     def test_both_mode_keeps_divisions_separate(self):
         mens_result = app.LineupResult(
@@ -382,6 +568,40 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(details["Alex Fast"]["points"], 10.0)
         self.assertEqual(details["John Doe"]["place_label"], "3rd")
         self.assertEqual(details["John Doe"]["points"], 6.0)
+
+    def test_event_standings_include_top_eight_projection_context(self):
+        school = [
+            app.Performance("School Fast", "100m", "10.60", 10.60, True, "Your Team", "school"),
+            app.Performance("School Depth", "100m", "11.20", 11.20, True, "Your Team", "school"),
+        ]
+        opponents = [
+            app.Performance(
+                f"Opponent Runner {index}",
+                "100m",
+                f"{10.70 + index / 100:.2f}",
+                10.70 + index / 100,
+                True,
+                f"Opponent School {index}",
+                "opponent",
+            )
+            for index in range(8)
+        ]
+        result = app.evaluate_lineup(
+            {"100m": ["School Fast", "School Depth"]},
+            {},
+            school,
+            opponents,
+        )
+        standings = result.event_standings["100m"]
+        self.assertEqual(len(standings), 8)
+        self.assertEqual(standings[0]["athlete"], "School Fast")
+        self.assertEqual(standings[0]["school"], "Your Team")
+        self.assertEqual(standings[0]["team_role"], "school")
+        self.assertEqual(standings[0]["projected_mark"], "10.60")
+        self.assertEqual(standings[0]["place_label"], "1st")
+        self.assertEqual(standings[0]["projected_points"], 10.0)
+        self.assertEqual(standings[-1]["place_label"], "8th")
+        self.assertEqual(standings[-1]["projected_points"], 1.0)
 
     def test_opponent_team_is_limited_to_top_three_entries(self):
         school = [
@@ -634,7 +854,16 @@ class OptimizerTests(unittest.TestCase):
             ("Bravo Runner", "Charlie Runner", "Delta Runner", "Alpha Runner"),
         )
         self.assertEqual(selection.leg_times, (50.0, 51.0, 52.0, 49.5))
-        self.assertAlmostEqual(selection.projected_time, 199.5)
+        self.assertEqual(
+            selection.leg_sources,
+            (
+                app.INDIVIDUAL_LEG_SOURCE,
+                app.RELAY_SPLIT_LEG_SOURCE,
+                app.RELAY_SPLIT_LEG_SOURCE,
+                app.RELAY_SPLIT_LEG_SOURCE,
+            ),
+        )
+        self.assertAlmostEqual(selection.projected_time, 201.9)
 
     def test_named_split_can_improve_synthetic_relay_only(self):
         school = [
@@ -658,7 +887,31 @@ class OptimizerTests(unittest.TestCase):
             [51.0],
         )
         self.assertIn(49.5, selection.leg_times)
-        self.assertAlmostEqual(selection.projected_time, 200.5)
+        self.assertEqual(
+            selection.leg_sources,
+            (
+                app.INDIVIDUAL_LEG_SOURCE,
+                app.INDIVIDUAL_LEG_SOURCE,
+                app.INDIVIDUAL_LEG_SOURCE,
+                app.RELAY_SPLIT_LEG_SOURCE,
+            ),
+        )
+        self.assertAlmostEqual(selection.projected_time, 201.7)
+
+    def test_synthetic_relay_credit_applies_only_to_individual_legs(self):
+        self.assertAlmostEqual(
+            app.synthetic_relay_time(
+                "4x100 relay",
+                (11.0, 11.1, 11.2, 10.8),
+                (
+                    app.INDIVIDUAL_LEG_SOURCE,
+                    app.RELAY_SPLIT_LEG_SOURCE,
+                    app.INDIVIDUAL_LEG_SOURCE,
+                    app.RELAY_SPLIT_LEG_SOURCE,
+                ),
+            ),
+            42.7,
+        )
 
     def test_low_scoring_relay_still_gets_depth_lineup(self):
         school = [
