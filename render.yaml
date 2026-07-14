@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: track-lineup-optimizer-beta
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
