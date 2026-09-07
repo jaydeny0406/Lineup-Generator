@@ -34,6 +34,23 @@ class ParserTests(unittest.TestCase):
             "https://www.athletic.net/team/99/track-and-field-indoor/2026/event-records",
         )
 
+    def test_detects_indoor_short_sprints_and_hurdles(self):
+        self.assertEqual(app.detect_event("Boys 55 Meters"), "55m")
+        self.assertEqual(app.detect_event("Girls 60 Meter Dash"), "60m")
+        self.assertEqual(app.detect_event("Boys 55 Meter Hurdles"), "55h")
+        self.assertEqual(app.detect_event("Girls 60mH"), "60h")
+        self.assertEqual(app.parse_mark("7.23h", "55m"), (7.23, True))
+
+    def test_meet_url_validation_rejects_mixed_seasons(self):
+        errors = app.validate_meet_urls(
+            "https://www.athletic.net/team/1/track-and-field-indoor/2026/event-records",
+            ["https://www.athletic.net/team/2/track-and-field-outdoor/2026/event-records"],
+            "indoor",
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Opponent 1 URL is for the outdoor season", errors[0])
+
     def test_parse_athletic_team_url_accepts_season_page_without_event_records(self):
         team_id, season_id, canonical = app.parse_athletic_team_url(
             "https://www.athletic.net/team/16797/track-and-field-outdoor/2026"
@@ -367,6 +384,143 @@ class ParserTests(unittest.TestCase):
 
 
 class OptimizerTests(unittest.TestCase):
+    def test_indoor_meet_config_uses_selected_short_sprint_program(self):
+        config = app.meet_config_for("indoor", "60")
+
+        self.assertEqual(
+            config.schedule_order[:10],
+            (
+                "4x800 relay",
+                "3200m",
+                "60h",
+                "60m",
+                "800m",
+                "4x200 relay",
+                "400m",
+                "1600m",
+                "200m",
+                "4x400 relay",
+            ),
+        )
+        self.assertEqual(
+            config.relay_events,
+            frozenset({"4x800 relay", "4x200 relay", "4x400 relay"}),
+        )
+        self.assertNotIn("4x100 relay", config.events)
+        self.assertNotIn("100m", config.events)
+        self.assertNotIn("110h", config.events)
+        self.assertNotIn("discus", config.events)
+
+    def test_indoor_conversion_uses_official_target_pr_when_available(self):
+        data = app.ScrapeResult(
+            [
+                app.Performance("Official Runner", "55m", "6.80", 6.8, True, "Team", "school"),
+                app.Performance("Official Runner", "60m", "7.20", 7.2, True, "Team", "school"),
+                app.Performance("Converted Runner", "55m", "6.90", 6.9, True, "Team", "school"),
+            ],
+            [],
+            [],
+        )
+
+        prepared = app.prepare_scrape_result_for_meet(data, app.meet_config_for("indoor", "60"))
+        marks = {perf.athlete: perf for perf in prepared.performances if perf.event == "60m"}
+
+        self.assertEqual(marks["Official Runner"].value, 7.2)
+        self.assertEqual(marks["Official Runner"].mark, "7.20")
+        self.assertAlmostEqual(marks["Converted Runner"].value, 6.9 * 1.071)
+        self.assertTrue(marks["Converted Runner"].mark.endswith("c"))
+
+    def test_indoor_short_event_entries_identify_historical_and_predicted_marks(self):
+        historical = app.Performance(
+            "Historical Runner", "60m", "7.20", 7.2, True, "Team", "school"
+        )
+        predicted = app.Performance(
+            "Predicted Runner", "60m", "7.39c", 7.39, True, "Team", "school"
+        )
+
+        self.assertEqual(app.entry_to_dict(historical)["mark_origin"], "historical")
+        self.assertEqual(app.entry_to_dict(predicted)["mark_origin"], "predicted")
+        standings = app.projected_event_standings("60m", [historical, predicted], [])
+        self.assertEqual(
+            [row["mark_origin"] for row in standings],
+            ["historical", "predicted"],
+        )
+
+    def test_indoor_conversion_divides_from_60_to_55_for_dash_and_hurdles(self):
+        data = app.ScrapeResult(
+            [
+                app.Performance("Dash Runner", "60m", "7.50", 7.5, True, "Team", "school"),
+                app.Performance("Hurdle Runner", "60h", "8.60", 8.6, True, "Team", "school"),
+            ],
+            [],
+            [],
+        )
+
+        prepared = app.prepare_scrape_result_for_meet(data, app.meet_config_for("indoor", "55"))
+        marks = {(perf.athlete, perf.event): perf.value for perf in prepared.performances}
+
+        self.assertAlmostEqual(marks[("Dash Runner", "55m")], 7.5 / 1.071)
+        self.assertAlmostEqual(marks[("Hurdle Runner", "55h")], 8.6 / 1.075)
+
+    def test_run_optimizer_applies_indoor_profile_without_outdoor_events(self):
+        scrape_result = app.ScrapeResult(
+            [
+                app.Performance("Converted Runner", "55m", "6.50", 6.5, True, "Indoor Team", "school"),
+                app.Performance("Official Runner", "60m", "7.10", 7.1, True, "Indoor Team", "school"),
+                app.Performance("Outdoor Only", "100m", "10.50", 10.5, True, "Indoor Team", "school"),
+            ],
+            [],
+            [],
+        )
+        url = "https://www.athletic.net/team/99/track-and-field-indoor/2026/event-records"
+
+        with patch("app.scrape_team_data", return_value=scrape_result):
+            result = app.run_optimizer(url, [], "mens", [], [], "indoor", "60")
+
+        self.assertTrue(
+            any(
+                error.startswith("No eligible recorded athletes were available")
+                for error in result.errors
+            )
+        )
+        self.assertEqual(result.scraped["season_type"], "indoor")
+        self.assertEqual(result.scraped["indoor_sprint_distance"], "60")
+        self.assertIn("60m", result.edit_context["events"])
+        self.assertNotIn("100m", result.edit_context["events"])
+        self.assertNotIn("4x100 relay", result.edit_context["events"])
+        school_events = {item["event"] for item in result.edit_context["school_performances"]}
+        self.assertEqual(school_events, {"60m"})
+
+    def test_run_optimizer_stops_before_scraping_a_mismatched_season_link(self):
+        outdoor_url = (
+            "https://www.athletic.net/team/99/track-and-field-outdoor/2026/event-records"
+        )
+
+        with patch("app.scrape_team_data") as scrape:
+            result = app.run_optimizer(outdoor_url, [], season_type="indoor")
+
+        scrape.assert_not_called()
+        self.assertEqual(result.total_points, 0.0)
+        self.assertIn("School URL is for the outdoor season", result.errors[0])
+
+    def test_outdoor_profile_remains_the_legacy_event_program(self):
+        config = app.meet_config_for("outdoor", "60")
+
+        self.assertEqual(config.events, tuple(app.EVENTS))
+        self.assertEqual(config.running_order, app.RUNNING_ORDER)
+        self.assertIn("4x100 relay", config.relay_events)
+        self.assertIn("100m", config.events)
+        self.assertNotIn("60m", config.events)
+
+    def test_indoor_distance_event_limits_match_outdoor_rules(self):
+        token = app.ACTIVE_MEET_CONFIG.set(app.meet_config_for("indoor", "55"))
+        try:
+            self.assertTrue(app.can_event_set_stand(["4x800 relay", "800m", "4x400 relay"]))
+            self.assertFalse(app.can_event_set_stand(["4x800 relay", "800m", "1600m"]))
+            self.assertFalse(app.can_event_set_stand(["800m", "1600m", "4x400 relay"]))
+        finally:
+            app.ACTIVE_MEET_CONFIG.reset(token)
+
     def test_injured_athlete_is_removed_from_all_team_data(self):
         data = app.ScrapeResult(
             performances=[
@@ -554,12 +708,43 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(optimizer.call_count, 2)
         self.assertEqual(
             optimizer.call_args_list[0].args,
-            ("school-url", ["opponent-url"], "mens", ["Injured Runner"], limits),
+            (
+                "school-url",
+                ["opponent-url"],
+                "mens",
+                ["Injured Runner"],
+                limits,
+                "outdoor",
+                "55",
+            ),
         )
         self.assertEqual(
             optimizer.call_args_list[1].args,
-            ("school-url", ["opponent-url"], "womens", ["Injured Runner"], limits),
+            (
+                "school-url",
+                ["opponent-url"],
+                "womens",
+                ["Injured Runner"],
+                limits,
+                "outdoor",
+                "55",
+            ),
         )
+
+    def test_both_divisions_receive_the_same_indoor_profile(self):
+        empty_result = app.LineupResult({}, {}, {}, 0.0, {}, [])
+
+        with patch("app.run_optimizer", return_value=empty_result) as optimizer:
+            app.run_optimizer_both(
+                "school-url",
+                [],
+                season_type="indoor",
+                indoor_sprint_distance="60",
+            )
+
+        self.assertEqual(optimizer.call_count, 2)
+        self.assertEqual(optimizer.call_args_list[0].args[-2:], ("indoor", "60"))
+        self.assertEqual(optimizer.call_args_list[1].args[-2:], ("indoor", "60"))
 
     def test_demo_lineup_applies_manual_event_limits(self):
         result = app.demo_result([{"athlete": "Alex Carter", "maxEvents": 2}])
@@ -620,6 +805,23 @@ class OptimizerTests(unittest.TestCase):
         self.assertIn("athleteEventLimits: collectAthleteEventLimits()", app.HTML_PAGE)
         self.assertIn("restoreAthleteEventLimits(state.athleteEventLimits || [])", app.HTML_PAGE)
         self.assertIn("athleteMaxEvents", app.HTML_PAGE)
+
+    def test_ui_includes_indoor_season_and_sprint_program_controls(self):
+        self.assertIn('id="season-type"', app.HTML_PAGE)
+        self.assertIn('<option value="outdoor" selected>Outdoor</option>', app.HTML_PAGE)
+        self.assertIn('<option value="indoor">Indoor</option>', app.HTML_PAGE)
+        self.assertIn('id="indoor-sprint-distance"', app.HTML_PAGE)
+        self.assertIn("55m and 55m Hurdles", app.HTML_PAGE)
+        self.assertIn("60m and 60m Hurdles", app.HTML_PAGE)
+        self.assertIn("markOriginBadge", app.HTML_PAGE)
+        self.assertIn("Historical", app.HTML_PAGE)
+        self.assertIn("Predicted", app.HTML_PAGE)
+        self.assertNotIn('id="demo-button"', app.HTML_PAGE)
+        self.assertNotIn("Use Demo Data", app.HTML_PAGE)
+        self.assertIn("seasonType: seasonTypeInput.value", app.HTML_PAGE)
+        self.assertIn("indoorSprintDistance: indoorSprintDistanceInput.value", app.HTML_PAGE)
+        self.assertIn("updateSeasonControls", app.HTML_PAGE)
+        self.assertIn("currentRunningOrder", app.HTML_PAGE)
 
     def test_school_url_input_has_no_default_link(self):
         self.assertIn('id="school-url"', app.HTML_PAGE)
@@ -689,6 +891,18 @@ class OptimizerTests(unittest.TestCase):
         self.assertIn("opponent_performances", result.edit_context)
         self.assertIn("relay_leg_values", result.edit_context)
         self.assertGreater(len(result.edit_context["school_performances"]), 0)
+
+    def test_indoor_demo_and_rescore_preserve_meet_profile(self):
+        result = app.demo_result(None, "indoor", "60")
+        self.assertEqual(result.edit_context["meet_config"]["season_type"], "indoor")
+        self.assertEqual(result.edit_context["meet_config"]["indoor_sprint_distance"], "60")
+        self.assertIn("60m", result.edit_context["events"])
+        self.assertNotIn("100m", result.edit_context["events"])
+
+        rescored = app.rescore_edited_result(app.asdict(result))
+        self.assertEqual(rescored.edit_context["meet_config"]["season_type"], "indoor")
+        self.assertIn("60m", rescored.edit_context["events"])
+        self.assertNotIn("100m", rescored.edit_context["events"])
 
     def test_rescore_edited_result_updates_points(self):
         result = app.demo_result()
@@ -1320,6 +1534,48 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(selection.method, "historic")
         self.assertEqual(selection.projected_time, 42.8)
         self.assertEqual(selection.athletes, ("Hidden Speed", "A Runner", "B Runner", "C Runner"))
+
+    def test_indoor_fastest_historic_4x200_is_reserved_before_individual_events(self):
+        token = app.ACTIVE_MEET_CONFIG.set(app.meet_config_for("indoor", "60"))
+        try:
+            school = [
+                app.Performance("Andrew Hebron", "60m", "7.25", 7.25, True, "Team", "school"),
+                app.Performance("Andrew Hebron", "200m", "22.64", 22.64, True, "Team", "school"),
+                app.Performance("Andrew Hebron", "400m", "50.78", 50.78, True, "Team", "school"),
+                app.Performance("Jude Knechtel", "60m", "7.30", 7.30, True, "Team", "school"),
+                app.Performance("Jude Knechtel", "200m", "23.12", 23.12, True, "Team", "school"),
+                app.Performance("Jude Knechtel", "400m", "51.68", 51.68, True, "Team", "school"),
+                app.Performance("Jayke Collins", "60m", "7.14", 7.14, True, "Team", "school"),
+                app.Performance("Jayke Collins", "200m", "23.66", 23.66, True, "Team", "school"),
+                app.Performance("Jayke Collins", "400m", "54.04", 54.04, True, "Team", "school"),
+                app.Performance("Mason Hill", "60h", "8.45", 8.45, True, "Team", "school"),
+                app.Performance("Mason Hill", "200m", "23.97", 23.97, True, "Team", "school"),
+            ]
+            history = [
+                app.RelayPerformance(
+                    "4x200 relay",
+                    ("Andrew Hebron", "Jude Knechtel", "Jayke Collins", "Mason Hill"),
+                    "1:29.18a",
+                    89.18,
+                    "Team",
+                    "school",
+                )
+            ]
+
+            result = app.build_lineup(school, [], history)
+            relay = result["relays"]["4x200 relay"]
+            athlete_events = app.collect_athlete_events(result["lineup"], result["relays"])
+
+            self.assertEqual(relay.method, "historic")
+            self.assertEqual(
+                relay.athletes,
+                ("Andrew Hebron", "Jude Knechtel", "Jayke Collins", "Mason Hill"),
+            )
+            self.assertIn("4x200 relay", athlete_events["Andrew Hebron"])
+            self.assertNotIn("400m", athlete_events["Andrew Hebron"])
+            self.assertTrue(app.lineup_is_valid(result["lineup"], result["relays"]))
+        finally:
+            app.ACTIVE_MEET_CONFIG.reset(token)
 
     def test_synthetic_relay_uses_fastest_split_and_requested_leg_order(self):
         school = [

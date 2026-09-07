@@ -4,6 +4,8 @@ A local Python web app that scrapes Athletic.net event-record pages, estimates s
 
 The Division selector supports `Mens`, `Womens`, and `Both`. Both mode generates two independent lineups and displays them in separate Mens and Womens result tabs.
 
+The Season selector supports outdoor and indoor lineups. Indoor mode lets the coach choose a 55m/55m hurdles or 60m/60m hurdles meet program; when an athlete only has a mark at the other distance, the optimizer applies the configured conversion factor as a fallback and labels it `Predicted` instead of `Historical`. Indoor lineups omit discus, and school and opponent Athletic.net links must match the selected season.
+
 List unavailable athletes in the `Injured athletes` box, one exact athlete name per line. Matching is case-insensitive, and injured athletes are removed from individual events, relay splits, and historic relay teams.
 
 ## Run
@@ -57,7 +59,8 @@ The generated Render URL can stay unadvertised and shared only with beta testers
 - If the API is unavailable, the app can still fall back to HTML/text parsing and Reader URL variants.
 - If `beautifulsoup4` is installed, fallback HTML parsing uses it for cleaner table extraction. If not, it uses the standard library.
 - The optimizer enforces four events per athlete and avoids consecutive running races.
+- Before assigning individual races, the optimizer reserves the earliest sprint relay's fully stacked team, preferring the fastest historical team unless a synthetic team is faster.
 - Projected individual-event fields include only each opponent team's best three athletes per event.
 - Relay projections include exactly one entry per opponent school: its fastest recorded relay, or one synthetic relay if it has no recorded team.
-- Finalization checks all 18 supported events. Relays below five projected points use depth runners instead of being omitted.
+- Finalization checks every event in the selected outdoor or indoor meet program. Relays below five projected points use depth runners instead of being omitted.
 - Individual scoring is `10 8 6 5 4 3 2 1`; relay scoring is `10 8 6 4 2`.
