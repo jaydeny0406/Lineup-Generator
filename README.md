@@ -8,6 +8,10 @@ The Season selector supports outdoor and indoor lineups. Indoor mode lets the co
 
 List unavailable athletes in the `Injured athletes` box, one exact athlete name per line. Matching is case-insensitive, and injured athletes are removed from individual events, relay splits, and historic relay teams.
 
+The team-wide event-limit selector can cap every athlete on the coach's school at two or three events for development-focused meets, while the standard setting remains four. Opponent projections continue to use their strongest valid lineups, and any stricter athlete-specific limit still takes precedence.
+
+After a coach manually moves, removes, or adds an athlete, the interface immediately rescores the lineup and shows the previous team score, new team score, and signed net point change. This feedback is retained when a lineup project is saved and reopened.
+
 ## Run
 
 ```powershell
@@ -58,7 +62,7 @@ The generated Render URL can stay unadvertised and shared only with beta testers
 - The scraper normalizes standard and Reader-prefixed Athletic.net event-records URLs, then uses Athletic.net's first-party event-records JSON endpoint.
 - If the API is unavailable, the app can still fall back to HTML/text parsing and Reader URL variants.
 - If `beautifulsoup4` is installed, fallback HTML parsing uses it for cleaner table extraction. If not, it uses the standard library.
-- The optimizer enforces four events per athlete and avoids consecutive running races.
+- The optimizer enforces the selected two-, three-, or four-event cap for the user's school and avoids consecutive running races.
 - Before assigning individual races, the optimizer reserves the earliest sprint relay's fully stacked team, preferring the fastest historical team unless a synthetic team is faster.
 - Projected individual-event fields include only each opponent team's best three athletes per event.
 - Relay projections include exactly one entry per opponent school: its fastest recorded relay, or one synthetic relay if it has no recorded team.

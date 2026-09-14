@@ -617,6 +617,48 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(app.athlete_max_events("Alex Carter", limits), 2)
         self.assertEqual(app.athlete_max_events("Unrestricted Runner", limits), 4)
 
+    def test_team_event_limit_accepts_only_supported_caps(self):
+        self.assertEqual(app.normalize_team_event_limit(None), 4)
+        self.assertEqual(app.normalize_team_event_limit("2"), 2)
+        self.assertEqual(app.normalize_team_event_limit(3), 3)
+        self.assertEqual(app.normalize_team_event_limit(4), 4)
+        with self.assertRaisesRegex(ValueError, "must be 2, 3, or 4"):
+            app.normalize_team_event_limit(1)
+
+    def test_team_event_limit_applies_only_to_school_athletes_and_keeps_stricter_limits(self):
+        school_data = app.ScrapeResult(
+            [
+                app.Performance("School Star", "100m", "10.80", 10.8, True, "School", "school"),
+            ],
+            [
+                app.RelayPerformance(
+                    "4x100 relay",
+                    ("Relay Only", "School Star", "Third Runner", "Fourth Runner"),
+                    "42.00",
+                    42.0,
+                    "School",
+                    "school",
+                )
+            ],
+            [
+                app.Performance(
+                    "Split Only", "100m", "10.60", 10.6, True, "School", "relay_split"
+                )
+            ],
+        )
+
+        limits = app.apply_team_event_limit_to_school(
+            school_data,
+            {"school star": 1},
+            2,
+        )
+
+        self.assertEqual(limits["school star"], 1)
+        self.assertEqual(limits["relay only"], 2)
+        self.assertEqual(limits["split only"], 2)
+        self.assertNotIn("opponent star", limits)
+        self.assertEqual(app.athlete_max_events("Opponent Star", limits), 4)
+
     def test_run_optimizer_respects_manual_athlete_event_limit(self):
         field_events = ["shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"]
         performances = []
@@ -650,6 +692,65 @@ class OptimizerTests(unittest.TestCase):
         )
         self.assertLessEqual(len(selected_events), 2)
         self.assertEqual(result.edit_context["athlete_event_limits"], {"limited star": 2})
+
+    def test_run_optimizer_respects_team_wide_event_limit(self):
+        field_events = ["shot put", "discus", "high jump", "pole vault", "long jump", "triple jump"]
+        performances = []
+        for index, event in enumerate(field_events):
+            performances.append(
+                app.Performance("All Event Star", event, str(120 + index), 120.0 + index, False, "School", "school")
+            )
+            performances.append(
+                app.Performance(f"Depth Athlete {index}", event, str(90 + index), 90.0 + index, False, "School", "school")
+            )
+        scrape_result = app.ScrapeResult(performances, [], [])
+
+        with patch("app.scrape_team_data", return_value=scrape_result):
+            result = app.run_optimizer("school-url", [], team_event_limit=2)
+
+        athlete_counts = defaultdict(int)
+        for entries in result.lineup.values():
+            for entry in entries:
+                athlete_counts[entry["athlete"]] += 1
+        for relay in result.relays.values():
+            for athlete in relay["athletes"]:
+                athlete_counts[athlete] += 1
+
+        self.assertTrue(athlete_counts)
+        self.assertTrue(all(count <= 2 for count in athlete_counts.values()))
+        self.assertEqual(result.edit_context["team_event_limit"], 2)
+        self.assertEqual(result.scraped["team_event_limit"], 2)
+
+    def test_indoor_standard_limit_scans_past_an_illegal_candidate_to_fill_four_events(self):
+        token = app.ACTIVE_MEET_CONFIG.set(app.meet_config_for("indoor", "55"))
+        try:
+            school = [
+                app.Performance("Priority Sprinter", "55m", "6.60", 6.6, True, "Team", "school"),
+                app.Performance("Priority Sprinter", "400m", "50.00", 50.0, True, "Team", "school"),
+                app.Performance("Priority Sprinter", "200m", "22.50", 22.5, True, "Team", "school"),
+                app.Performance("Priority Sprinter", "long jump", "21' 0", 252.0, False, "Team", "school"),
+            ]
+            history = [
+                app.RelayPerformance(
+                    "4x200 relay",
+                    ("Priority Sprinter", "Relay Two", "Relay Three", "Relay Four"),
+                    "1:30.00",
+                    90.0,
+                    "Team",
+                    "school",
+                )
+            ]
+
+            result = app.build_lineup(school, [], history, athlete_event_limits={})
+            athlete_events = app.collect_athlete_events(result["lineup"], result["relays"])
+
+            self.assertEqual(
+                set(athlete_events["Priority Sprinter"]),
+                {"55m", "200m", "long jump", "4x200 relay"},
+            )
+            self.assertTrue(app.lineup_is_valid(result["lineup"], result["relays"]))
+        finally:
+            app.ACTIVE_MEET_CONFIG.reset(token)
 
     def test_lineup_validation_counts_individual_and_relay_events_against_manual_limit(self):
         lineup = {"100m": ["Limited Runner"]}
@@ -716,6 +817,7 @@ class OptimizerTests(unittest.TestCase):
                 limits,
                 "outdoor",
                 "55",
+                4,
             ),
         )
         self.assertEqual(
@@ -728,6 +830,7 @@ class OptimizerTests(unittest.TestCase):
                 limits,
                 "outdoor",
                 "55",
+                4,
             ),
         )
 
@@ -743,8 +846,18 @@ class OptimizerTests(unittest.TestCase):
             )
 
         self.assertEqual(optimizer.call_count, 2)
-        self.assertEqual(optimizer.call_args_list[0].args[-2:], ("indoor", "60"))
-        self.assertEqual(optimizer.call_args_list[1].args[-2:], ("indoor", "60"))
+        self.assertEqual(optimizer.call_args_list[0].args[-3:], ("indoor", "60", 4))
+        self.assertEqual(optimizer.call_args_list[1].args[-3:], ("indoor", "60", 4))
+
+    def test_both_divisions_receive_the_same_team_event_limit(self):
+        empty_result = app.LineupResult({}, {}, {}, 0.0, {}, [])
+
+        with patch("app.run_optimizer", return_value=empty_result) as optimizer:
+            app.run_optimizer_both("school-url", [], team_event_limit=3)
+
+        self.assertEqual(optimizer.call_count, 2)
+        self.assertEqual(optimizer.call_args_list[0].args[-1], 3)
+        self.assertEqual(optimizer.call_args_list[1].args[-1], 3)
 
     def test_demo_lineup_applies_manual_event_limits(self):
         result = app.demo_result([{"athlete": "Alex Carter", "maxEvents": 2}])
@@ -805,6 +918,28 @@ class OptimizerTests(unittest.TestCase):
         self.assertIn("athleteEventLimits: collectAthleteEventLimits()", app.HTML_PAGE)
         self.assertIn("restoreAthleteEventLimits(state.athleteEventLimits || [])", app.HTML_PAGE)
         self.assertIn("athleteMaxEvents", app.HTML_PAGE)
+
+    def test_ui_includes_school_wide_event_limit_control(self):
+        self.assertIn('id="team-event-limit"', app.HTML_PAGE)
+        self.assertIn('<option value="4" selected>4 events (standard)</option>', app.HTML_PAGE)
+        self.assertIn('<option value="3">3 events</option>', app.HTML_PAGE)
+        self.assertIn('<option value="2">2 events</option>', app.HTML_PAGE)
+        self.assertIn("teamEventLimit: Number(teamEventLimitInput.value)", app.HTML_PAGE)
+        self.assertGreaterEqual(
+            app.HTML_PAGE.count("teamEventLimit: Number(teamEventLimitInput.value)"),
+            2,
+        )
+        self.assertIn("state.teamEventLimit", app.HTML_PAGE)
+
+    def test_ui_shows_persistent_score_delta_after_manual_edits(self):
+        self.assertIn('id="score-change"', app.HTML_PAGE)
+        self.assertIn('aria-live="polite"', app.HTML_PAGE)
+        self.assertIn("manualScoreChanges", app.HTML_PAGE)
+        self.assertIn("const previousPoints", app.HTML_PAGE)
+        self.assertIn("after: Number(data.total_points || 0)", app.HTML_PAGE)
+        self.assertIn("Projected team score changed from", app.HTML_PAGE)
+        self.assertIn("No estimated net change", app.HTML_PAGE)
+        self.assertIn("position: sticky", app.HTML_PAGE)
 
     def test_ui_includes_indoor_season_and_sprint_program_controls(self):
         self.assertIn('id="season-type"', app.HTML_PAGE)

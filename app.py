@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 
 INDIVIDUAL_POINTS = [10, 8, 6, 5, 4, 3, 2, 1]
 RELAY_POINTS = [10, 8, 6, 4, 2]
-APP_VERSION = "2026.09.06-stacked-relay-v29"
+APP_VERSION = "2026.09.13-team-limits-score-delta-v31"
 MAX_EVENTS_PER_ATHLETE = 4
 MAX_INDIVIDUAL_ENTRIES = 3
 ELITE_ATHLETE_COUNT = 5
@@ -1387,7 +1387,11 @@ def build_lineup(
             athlete_events[athlete].append(stacked_relay.event)
 
     for athlete in athlete_order:
-        for event, _mark, score in by_athlete[athlete][:3]:
+        for event, _mark, score in by_athlete[athlete]:
+            if len(athlete_events[athlete]) >= athlete_max_events(
+                athlete, athlete_event_limits
+            ):
+                break
             if event in RELAY_EVENTS or score <= 0:
                 continue
             try_add_entry(lineup, athlete_events, athlete, event, athlete_event_limits=athlete_event_limits)
@@ -3649,6 +3653,7 @@ def attach_edit_context(
     school_relay_splits: list[Performance] | None = None,
     opponent_relay_splits: list[Performance] | None = None,
     athlete_event_limits: dict[str, int] | None = None,
+    team_event_limit: int = MAX_EVENTS_PER_ATHLETE,
 ) -> LineupResult:
     """Attach compact source data needed for coach edits and rescoring."""
     result.edit_context = build_edit_context(
@@ -3659,6 +3664,7 @@ def attach_edit_context(
         school_relay_splits or [],
         opponent_relay_splits or [],
         athlete_event_limits or {},
+        team_event_limit,
     )
     return result
 
@@ -3671,6 +3677,7 @@ def build_edit_context(
     school_relay_splits: list[Performance],
     opponent_relay_splits: list[Performance],
     athlete_event_limits: dict[str, int] | None = None,
+    team_event_limit: int = MAX_EVENTS_PER_ATHLETE,
 ) -> dict[str, Any]:
     """Build the data package the UI uses for manual lineup edits."""
     relay_leg_values = {
@@ -3692,7 +3699,8 @@ def build_edit_context(
         "relay_events": sorted(current_meet_config().relay_events),
         "field_events": sorted(FIELD_EVENTS),
         "distance_events": sorted(DISTANCE_EVENTS),
-        "max_events_per_athlete": MAX_EVENTS_PER_ATHLETE,
+        "max_events_per_athlete": team_event_limit,
+        "team_event_limit": team_event_limit,
         "athlete_event_limits": athlete_event_limits or {},
         "max_individual_entries": MAX_INDIVIDUAL_ENTRIES,
         "school_performances": [performance_to_dict(perf) for perf in school],
@@ -3803,6 +3811,9 @@ def _rescore_edited_result_active(payload: dict[str, Any]) -> LineupResult:
         for item in context.get("school_relay_splits", [])
     ]
     athlete_event_limits = normalize_athlete_event_limits(context.get("athlete_event_limits", {}))
+    team_event_limit = normalize_team_event_limit(
+        context.get("team_event_limit", context.get("max_events_per_athlete", MAX_EVENTS_PER_ATHLETE))
+    )
     lineup = edited_lineup_from_payload(payload.get("lineup") or {})
     relays = edited_relays_from_payload(payload.get("relays") or {})
     violations = event_limit_violations(lineup, relays, athlete_event_limits)
@@ -3825,6 +3836,7 @@ def _rescore_edited_result_active(payload: dict[str, Any]) -> LineupResult:
         school_relay_splits,
         opponent_relay_splits,
         athlete_event_limits,
+        team_event_limit,
     )
 
 
@@ -4061,6 +4073,39 @@ def normalize_athlete_event_limits(raw_limits: Any) -> dict[str, int]:
     return normalized
 
 
+def normalize_team_event_limit(raw_limit: Any) -> int:
+    """Normalize the school-wide event cap, with four events as the standard default."""
+    if raw_limit is None or raw_limit == "":
+        return MAX_EVENTS_PER_ATHLETE
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Choose a valid team-wide event limit.") from exc
+    if limit not in {2, 3, MAX_EVENTS_PER_ATHLETE}:
+        raise ValueError("The team-wide event limit must be 2, 3, or 4 events.")
+    return limit
+
+
+def apply_team_event_limit_to_school(
+    data: ScrapeResult,
+    athlete_event_limits: dict[str, int] | None,
+    team_event_limit: Any,
+) -> dict[str, int]:
+    """Apply a global cap only to athletes contained in the user's school data."""
+    limit = normalize_team_event_limit(team_event_limit)
+    effective_limits = dict(athlete_event_limits or {})
+    if limit == MAX_EVENTS_PER_ATHLETE:
+        return effective_limits
+    athlete_names = {perf.athlete for perf in data.performances}
+    athlete_names.update(split.athlete for split in data.relay_splits)
+    athlete_names.update(athlete for relay in data.relay_history for athlete in relay.athletes)
+    for athlete in athlete_names:
+        key = normalize_athlete_name(athlete)
+        if key:
+            effective_limits[key] = min(limit, effective_limits.get(key, MAX_EVENTS_PER_ATHLETE))
+    return effective_limits
+
+
 def athlete_max_events(
     athlete: str, athlete_event_limits: dict[str, int] | None = None
 ) -> int:
@@ -4115,9 +4160,11 @@ def run_optimizer(
     athlete_event_limits: Any = None,
     season_type: str = "outdoor",
     indoor_sprint_distance: str = "55",
+    team_event_limit: Any = MAX_EVENTS_PER_ATHLETE,
 ) -> LineupResult:
     """Activate a meet profile, validate its links, and run the optimizer."""
     meet_config = meet_config_for(season_type, indoor_sprint_distance)
+    normalized_team_event_limit = normalize_team_event_limit(team_event_limit)
     token = ACTIVE_MEET_CONFIG.set(meet_config)
     try:
         entered_urls = [school_url, *opponent_urls]
@@ -4143,6 +4190,7 @@ def run_optimizer(
             gender,
             injured_athletes,
             athlete_event_limits,
+            normalized_team_event_limit,
         )
     finally:
         ACTIVE_MEET_CONFIG.reset(token)
@@ -4154,6 +4202,7 @@ def _run_optimizer_active(
     gender: str = "mens",
     injured_athletes: list[str] | None = None,
     athlete_event_limits: Any = None,
+    team_event_limit: Any = MAX_EVENTS_PER_ATHLETE,
 ) -> LineupResult:
     """Scrape inputs, build a lineup, and evaluate the final projection."""
     errors: list[str] = []
@@ -4165,6 +4214,8 @@ def _run_optimizer_active(
     school_relay_splits: list[Performance] = []
     opponent_results: list[tuple[int, ScrapeResult]] = []
     normalized_event_limits = normalize_athlete_event_limits(athlete_event_limits)
+    normalized_team_event_limit = normalize_team_event_limit(team_event_limit)
+    effective_event_limits = dict(normalized_event_limits)
     try:
         school_result = scrape_team_data(school_url, "school", "Your Team", gender)
         school_result = filter_injured_athletes(school_result, injured_athletes or [])
@@ -4172,6 +4223,11 @@ def _run_optimizer_active(
         school = school_result.performances
         school_relay_history = school_result.relay_history
         school_relay_splits = school_result.relay_splits
+        effective_event_limits = apply_team_event_limit_to_school(
+            school_result,
+            normalized_event_limits,
+            normalized_team_event_limit,
+        )
     except Exception as exc:
         errors.append(str(exc))
     for index, url in enumerate(opponent_urls, start=1):
@@ -4198,6 +4254,7 @@ def _run_optimizer_active(
                 "opponent_records": len(raw_opponents),
                 "season_type": current_meet_config().season_type,
                 "indoor_sprint_distance": current_meet_config().indoor_sprint_distance,
+                "team_event_limit": normalized_team_event_limit,
             },
             errors,
         )
@@ -4223,10 +4280,10 @@ def _run_optimizer_active(
         [],
         school_relay_splits,
         [],
-        normalized_event_limits,
+        effective_event_limits,
     )
     violations = event_limit_violations(
-        raw_lineup["lineup"], raw_lineup["relays"], normalized_event_limits
+        raw_lineup["lineup"], raw_lineup["relays"], effective_event_limits
     )
     if violations:
         errors.append(
@@ -4243,6 +4300,7 @@ def _run_optimizer_active(
                 "opponent_records": len(raw_opponents),
                 "season_type": current_meet_config().season_type,
                 "indoor_sprint_distance": current_meet_config().indoor_sprint_distance,
+                "team_event_limit": normalized_team_event_limit,
             },
             errors,
         )
@@ -4262,6 +4320,7 @@ def _run_optimizer_active(
         "opponent_teams": opponent_teams,
         "season_type": current_meet_config().season_type,
         "indoor_sprint_distance": current_meet_config().indoor_sprint_distance,
+        "team_event_limit": normalized_team_event_limit,
     }
     missing_events = raw_lineup.get("missing_events", [])
     if missing_events:
@@ -4278,7 +4337,8 @@ def _run_optimizer_active(
         [],
         school_relay_splits,
         [],
-        normalized_event_limits,
+        effective_event_limits,
+        normalized_team_event_limit,
     )
 
 
@@ -4289,6 +4349,7 @@ def run_optimizer_both(
     athlete_event_limits: Any = None,
     season_type: str = "outdoor",
     indoor_sprint_distance: str = "55",
+    team_event_limit: Any = MAX_EVENTS_PER_ATHLETE,
 ) -> dict[str, Any]:
     """Generate independent men's and women's lineups without combining their athlete pools."""
     return {
@@ -4303,6 +4364,7 @@ def run_optimizer_both(
                     athlete_event_limits,
                     season_type,
                     indoor_sprint_distance,
+                    team_event_limit,
                 )
             ),
             "womens": asdict(
@@ -4314,6 +4376,7 @@ def run_optimizer_both(
                     athlete_event_limits,
                     season_type,
                     indoor_sprint_distance,
+                    team_event_limit,
                 )
             ),
         },
@@ -4751,6 +4814,35 @@ HTML_PAGE = r"""
     }
     .metric strong { display: block; font-size: 1.55rem; }
     .metric span, .muted { color: var(--muted); font-size: .92rem; }
+    .score-change {
+      position: sticky;
+      top: 70px;
+      z-index: 9;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: -6px 0 18px;
+      padding: 11px 14px;
+      border: 1px solid var(--line);
+      border-left: 4px solid #6c7884;
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: 0 8px 22px rgba(23, 32, 42, .12);
+    }
+    .score-change[hidden] { display: none; }
+    .score-change-label {
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .score-change strong { font-size: 1.1rem; white-space: nowrap; }
+    .score-change-detail { color: var(--muted); font-size: .88rem; }
+    .score-change.positive { border-left-color: var(--ok); background: #f1faf5; }
+    .score-change.positive strong { color: var(--ok); }
+    .score-change.negative { border-left-color: #a3281a; background: #fff4f2; }
+    .score-change.negative strong { color: #8a2116; }
+    .score-change.neutral { border-left-color: #788692; background: #f7f9fb; }
     .mark-origin {
       display: inline-flex;
       align-items: center;
@@ -5233,6 +5325,12 @@ HTML_PAGE = r"""
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       .summary { grid-template-columns: 1fr; }
+      .score-change {
+        top: 62px;
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
       .athlete-panel {
         top: auto;
         left: 12px;
@@ -5245,7 +5343,7 @@ HTML_PAGE = r"""
 <body>
   <header>
     <h1>Track Lineup Optimizer</h1>
-    <div class="version">Build 2026.09.06-v29</div>
+    <div class="version">Build 2026.09.13-v31</div>
   </header>
   <main>
     <aside>
@@ -5274,6 +5372,12 @@ HTML_PAGE = r"""
         <textarea id="opponents" name="opponents" placeholder="One URL per line"></textarea>
         <label for="injured-athletes">Injured / unavailable athletes</label>
         <textarea id="injured-athletes" name="injuredAthletes" placeholder="One unavailable athlete per line, including opponents"></textarea>
+        <label for="team-event-limit">Limit every school athlete to</label>
+        <select id="team-event-limit" name="teamEventLimit">
+          <option value="4" selected>4 events (standard)</option>
+          <option value="3">3 events</option>
+          <option value="2">2 events</option>
+        </select>
         <label>School athlete event limits</label>
         <div id="athlete-limit-list" class="athlete-limit-list"></div>
         <button id="add-athlete-limit" class="secondary add-limit-button" type="button">Add athlete limit</button>
@@ -5303,6 +5407,11 @@ HTML_PAGE = r"""
         <div class="metric"><strong id="opponent-count">0</strong><span>opponent records parsed</span></div>
         <div class="metric team-score-metric"><strong>Projected Team Scores</strong><div id="team-points" class="team-scores"></div></div>
       </div>
+      <div id="score-change" class="score-change" aria-live="polite" hidden>
+        <span class="score-change-label">Last manual change</span>
+        <strong id="score-change-delta">0.0 points</strong>
+        <span id="score-change-detail" class="score-change-detail"></span>
+      </div>
       <div id="results" class="grid"></div>
     </section>
   </main>
@@ -5331,6 +5440,7 @@ HTML_PAGE = r"""
     const genderInput = document.querySelector("#gender");
     const opponentsInput = document.querySelector("#opponents");
     const injuredAthletesInput = document.querySelector("#injured-athletes");
+    const teamEventLimitInput = document.querySelector("#team-event-limit");
     const athleteLimitList = document.querySelector("#athlete-limit-list");
     const addAthleteLimitButton = document.querySelector("#add-athlete-limit");
     const results = document.querySelector("#results");
@@ -5344,7 +5454,10 @@ HTML_PAGE = r"""
     const athletePanelEvents = document.querySelector("#athlete-panel-events");
     const athletePanelClose = document.querySelector("#athlete-panel-close");
     const teamPointsList = document.querySelector("#team-points");
-    const APP_BUILD_VERSION = "2026.09.06-stacked-relay-v29";
+    const scoreChange = document.querySelector("#score-change");
+    const scoreChangeDelta = document.querySelector("#score-change-delta");
+    const scoreChangeDetail = document.querySelector("#score-change-detail");
+    const APP_BUILD_VERSION = "2026.09.13-team-limits-score-delta-v31";
     const PROJECT_SCHEMA_VERSION = 1;
     const OUTDOOR_EVENT_SORT_ORDERS = {
       schedule: [
@@ -5387,6 +5500,7 @@ HTML_PAGE = r"""
     let selectedEventInfo = "";
     let panelDrag = null;
     let editState = null;
+    let manualScoreChanges = {};
 
     seasonTypeInput.addEventListener("change", updateSeasonControls);
     updateSeasonControls();
@@ -5398,6 +5512,7 @@ HTML_PAGE = r"""
         opponentUrls: opponentsInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
         injuredAthletes: injuredAthletesInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
         athleteEventLimits: collectAthleteEventLimits(),
+        teamEventLimit: Number(teamEventLimitInput.value),
         gender: genderInput.value,
         seasonType: seasonTypeInput.value,
         indoorSprintDistance: indoorSprintDistanceInput.value
@@ -5476,6 +5591,7 @@ HTML_PAGE = r"""
 
     async function optimize(url, payload) {
       runButton.disabled = true;
+      manualScoreChanges = {};
       results.innerHTML = "";
       errors.innerHTML = "";
       closeAthletePanel();
@@ -5507,6 +5623,7 @@ HTML_PAGE = r"""
         form: currentFormState(),
         activeEventSort,
         activeDivision,
+        manualScoreChanges: cloneResult(manualScoreChanges),
         result: divisionResults
           ? {mode: "both", division_results: cloneResult(divisionResults)}
           : cloneResult(currentResult)
@@ -5539,6 +5656,9 @@ HTML_PAGE = r"""
         throw new Error("The saved project does not include lineup results.");
       }
       restoreFormState(project.form || {});
+      manualScoreChanges = project.manualScoreChanges && typeof project.manualScoreChanges === "object"
+        ? cloneResult(project.manualScoreChanges)
+        : {};
       activeEventSort = ["distance", "schedule"].includes(project.activeEventSort) ? project.activeEventSort : "distance";
       updateEventSortControls();
       closeAthletePanel();
@@ -5562,6 +5682,7 @@ HTML_PAGE = r"""
         opponentUrls: opponentsInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
         injuredAthletes: injuredAthletesInput.value.split(/\n+/).map(x => x.trim()).filter(Boolean),
         athleteEventLimits: collectAthleteEventLimits(),
+        teamEventLimit: Number(teamEventLimitInput.value),
         gender: genderInput.value,
         seasonType: seasonTypeInput.value,
         indoorSprintDistance: indoorSprintDistanceInput.value
@@ -5579,6 +5700,9 @@ HTML_PAGE = r"""
       schoolUrlInput.value = state.schoolUrl || "";
       opponentsInput.value = Array.isArray(state.opponentUrls) ? state.opponentUrls.join("\n") : "";
       injuredAthletesInput.value = Array.isArray(state.injuredAthletes) ? state.injuredAthletes.join("\n") : "";
+      teamEventLimitInput.value = ["2", "3", "4"].includes(String(state.teamEventLimit))
+        ? String(state.teamEventLimit)
+        : "4";
       restoreAthleteEventLimits(state.athleteEventLimits || []);
       if (["mens", "womens", "both"].includes(state.gender)) genderInput.value = state.gender;
     }
@@ -5740,6 +5864,7 @@ HTML_PAGE = r"""
       document.querySelector("#school-count").textContent = currentResult.scraped?.school_records || 0;
       document.querySelector("#opponent-count").textContent = currentResult.scraped?.opponent_records || 0;
       renderTeamScores(currentResult);
+      renderScoreChange();
       errors.innerHTML = (currentResult.errors || []).map(error => `<div class="error">${escapeHtml(error)}</div>`).join("");
       const eventPoints = currentResult.event_points || {};
       const cards = [];
@@ -5750,6 +5875,33 @@ HTML_PAGE = r"""
         if (relay) cards.push(renderRelayEventCard(event, relay));
       }
       results.innerHTML = cards.join("") || `<div class="panel">No lineup could be generated from the parsed records.</div>`;
+    }
+
+    function scoreChangeKey() {
+      return divisionResults ? `division:${activeDivision}` : "single";
+    }
+
+    function renderScoreChange() {
+      const change = manualScoreChanges[scoreChangeKey()];
+      if (!change) {
+        scoreChange.hidden = true;
+        scoreChange.classList.remove("positive", "negative", "neutral");
+        return;
+      }
+      const before = Number(change.before || 0);
+      const after = Number(change.after || 0);
+      const delta = after - before;
+      const isNeutral = Math.abs(delta) < 0.005;
+      scoreChange.hidden = false;
+      scoreChange.classList.toggle("positive", delta > 0.005);
+      scoreChange.classList.toggle("negative", delta < -0.005);
+      scoreChange.classList.toggle("neutral", isNeutral);
+      scoreChangeDelta.textContent = isNeutral
+        ? "0.0 points"
+        : `${delta > 0 ? "+" : ""}${delta.toFixed(1)} points`;
+      scoreChangeDetail.textContent = isNeutral
+        ? `No estimated net change (${before.toFixed(1)} to ${after.toFixed(1)} projected points).`
+        : `Projected team score changed from ${before.toFixed(1)} to ${after.toFixed(1)} points.`;
     }
 
     function renderIndividualEventCard(event, entries, eventPoints) {
@@ -6183,6 +6335,8 @@ HTML_PAGE = r"""
 
     async function rescoreEditedLineup(next) {
       athletePanelCount.textContent = "rescoring...";
+      const previousPoints = Number(currentResult?.total_points || 0);
+      const changeKey = scoreChangeKey();
       const response = await fetch("/api/rescore", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -6194,6 +6348,10 @@ HTML_PAGE = r"""
       });
       const data = await response.json();
       if (!response.ok) throw new Error((data.errors || [data.error || "Could not rescore edited lineup."])[0]);
+      manualScoreChanges[changeKey] = {
+        before: previousPoints,
+        after: Number(data.total_points || 0)
+      };
       if (divisionResults) divisionResults[activeDivision] = data;
       renderSingle(data);
     }
@@ -6458,8 +6616,11 @@ HTML_PAGE = r"""
     }
 
     function athleteMaxEvents(athlete) {
-      const limits = currentResult?.edit_context?.athlete_event_limits || {};
-      const limit = Number(limits[athleteLimitKey(athlete)] || 4);
+      const context = currentResult?.edit_context || {};
+      const limits = context.athlete_event_limits || {};
+      const teamLimit = Number(context.team_event_limit || context.max_events_per_athlete || 4);
+      const athleteLimit = Number(limits[athleteLimitKey(athlete)] || 4);
+      const limit = Math.min(teamLimit, athleteLimit);
       return Number.isInteger(limit) && limit >= 1 && limit <= 4 ? limit : 4;
     }
 
@@ -6529,6 +6690,7 @@ class AppHandler(BaseHTTPRequestHandler):
             opponent_urls = payload.get("opponentUrls", [])
             injured_athletes = payload.get("injuredAthletes", [])
             athlete_event_limits = payload.get("athleteEventLimits", [])
+            team_event_limit = payload.get("teamEventLimit", MAX_EVENTS_PER_ATHLETE)
             gender = clean_text(payload.get("gender", "mens")).lower() or "mens"
             if not school_url:
                 self.send_json({"errors": ["Enter a school Athletic.net event records URL."], "total_points": 0}, status=400)
@@ -6537,6 +6699,7 @@ class AppHandler(BaseHTTPRequestHandler):
             cleaned_injured_athletes = [clean_text(name) for name in injured_athletes]
             try:
                 cleaned_event_limits = normalize_athlete_event_limits(athlete_event_limits)
+                cleaned_team_event_limit = normalize_team_event_limit(team_event_limit)
             except ValueError as exc:
                 self.send_json({"errors": [str(exc)], "total_points": 0}, status=400)
                 return
@@ -6549,6 +6712,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         cleaned_event_limits,
                         season_type,
                         indoor_sprint_distance,
+                        cleaned_team_event_limit,
                     )
                 )
                 return
@@ -6563,6 +6727,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 cleaned_event_limits,
                 season_type,
                 indoor_sprint_distance,
+                cleaned_team_event_limit,
             )
             self.send_json(asdict(result))
         except Exception as exc:
