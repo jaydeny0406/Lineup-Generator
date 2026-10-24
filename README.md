@@ -33,6 +33,19 @@ http://127.0.0.1:8000
 
 Check the running build at `http://127.0.0.1:8000/api/health`.
 
+## Code Layout
+
+- `app.py`: HTTP routes, server startup, and compatibility exports for existing imports.
+- `lineup/domain.py`: event definitions, meet profiles, data models, and shared rules.
+- `lineup/records.py`: Athletic.net fetching and record parsing.
+- `lineup/optimizer.py`: individual/relay selection and lineup improvements.
+- `lineup/scoring.py`: fatigue, projected places, and team scoring.
+- `lineup/edits.py`: manual-edit context and rescoring.
+- `lineup/service.py`: request validation and division-level orchestration.
+- `ui/index.html`, `ui/styles.css`, `ui/app.js`: page structure, styles, and interactions. The server assembles these into the existing page response.
+
+Place new code in the module that owns its behavior; `app.py` should remain a small entry point. Run `python -m unittest` after changes.
+
 ## Test
 
 ```powershell

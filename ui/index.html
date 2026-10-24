@@ -1,0 +1,99 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Track Lineup Optimizer</title>
+  <style>__INLINE_CSS__</style>
+</head>
+<body>
+  <header>
+    <h1>Track Lineup Optimizer</h1>
+    <div class="version">Build 2026.09.13-v31</div>
+  </header>
+  <main>
+    <aside>
+      <form id="optimizer-form">
+        <label for="season-type">Season</label>
+        <select id="season-type" name="seasonType">
+          <option value="outdoor" selected>Outdoor</option>
+          <option value="indoor">Indoor</option>
+        </select>
+        <div id="indoor-sprint-settings" class="season-specific" hidden>
+          <label for="indoor-sprint-distance">Indoor sprint events</label>
+          <select id="indoor-sprint-distance" name="indoorSprintDistance">
+            <option value="55" selected>55m and 55m Hurdles</option>
+            <option value="60">60m and 60m Hurdles</option>
+          </select>
+        </div>
+        <label for="school-url">School Athletic.net event records URL</label>
+        <input id="school-url" name="schoolUrl" placeholder="Paste Athletic.net event records URL">
+        <label for="gender">Division</label>
+        <select id="gender" name="gender">
+          <option value="mens" selected>Mens</option>
+          <option value="womens">Womens</option>
+          <option value="both">Both</option>
+        </select>
+        <label for="opponents">Opponent event records URLs</label>
+        <textarea id="opponents" name="opponents" placeholder="One URL per line"></textarea>
+        <label for="injured-athletes">Injured / unavailable athletes</label>
+        <textarea id="injured-athletes" name="injuredAthletes" placeholder="One unavailable athlete per line, including opponents"></textarea>
+        <label for="team-event-limit">Limit every school athlete to</label>
+        <select id="team-event-limit" name="teamEventLimit">
+          <option value="4" selected>4 events (standard)</option>
+          <option value="3">3 events</option>
+          <option value="2">2 events</option>
+        </select>
+        <label>School athlete event limits</label>
+        <div id="athlete-limit-list" class="athlete-limit-list"></div>
+        <button id="add-athlete-limit" class="secondary add-limit-button" type="button">Add athlete limit</button>
+        <div class="actions">
+          <button id="run-button" type="submit">Generate Lineup</button>
+          <button class="secondary" id="save-button" type="button">Save Lineup</button>
+          <button class="secondary" id="load-button" type="button">Load Saved Lineup</button>
+          <input class="file-input-hidden" id="load-file" type="file" accept="application/json,.json">
+        </div>
+      </form>
+    </aside>
+    <section>
+      <div class="lineup-controls">
+        <div id="division-tabs" class="division-tabs" hidden>
+          <button class="division-tab active" data-division="mens" type="button">Mens</button>
+          <button class="division-tab" data-division="womens" type="button">Womens</button>
+        </div>
+        <div id="event-sort" class="event-sort" aria-label="Event order">
+          <button class="sort-option active" data-sort="distance" type="button">Distance</button>
+          <button class="sort-option" data-sort="schedule" type="button">Schedule</button>
+        </div>
+      </div>
+      <div id="errors"></div>
+      <div class="summary">
+        <div class="metric"><strong id="total-points">0</strong><span>projected points</span></div>
+        <div class="metric"><strong id="school-count">0</strong><span>school records parsed</span></div>
+        <div class="metric"><strong id="opponent-count">0</strong><span>opponent records parsed</span></div>
+        <div class="metric team-score-metric"><strong>Projected Team Scores</strong><div id="team-points" class="team-scores"></div></div>
+      </div>
+      <div id="score-change" class="score-change" aria-live="polite" hidden>
+        <span class="score-change-label">Last manual change</span>
+        <strong id="score-change-delta">0.0 points</strong>
+        <span id="score-change-detail" class="score-change-detail"></span>
+      </div>
+      <div id="results" class="grid"></div>
+    </section>
+  </main>
+  <div id="athlete-panel" class="athlete-panel" role="dialog" aria-modal="false" aria-labelledby="athlete-panel-name" hidden>
+    <div id="athlete-panel-head" class="athlete-panel-head">
+      <div class="athlete-panel-title">
+        <strong id="athlete-panel-name">Athlete</strong>
+        <span id="athlete-panel-count">0 events</span>
+      </div>
+      <button id="athlete-panel-close" class="athlete-panel-close" type="button" aria-label="Close athlete overview">x</button>
+    </div>
+    <div class="athlete-panel-body">
+      <ul id="athlete-panel-events" class="athlete-event-list"></ul>
+    </div>
+  </div>
+  <script>__INLINE_JS__</script>
+</body>
+</html>
